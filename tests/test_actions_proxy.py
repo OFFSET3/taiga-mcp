@@ -1,5 +1,6 @@
 import pytest
 from contextlib import asynccontextmanager
+from typing import Any
 from starlette.testclient import TestClient
 
 import app
@@ -10,6 +11,7 @@ class DummyTaigaClient:
     def __init__(self) -> None:
         self.projects: list[dict] = []
         self.epics_by_project: dict[int, list[dict]] = {}
+        self.user_stories_by_project: dict[int, list[dict]] = {}
         self.statuses_by_project: dict[int, list[dict]] = {}
         self.raise_map: dict[str, Exception] = {}
         self.created_payloads: list[dict] = []
@@ -18,6 +20,7 @@ class DummyTaigaClient:
         self.list_projects_params = None
         self.project_details: dict[int, dict] = {}
         self.project_details_by_slug: dict[str, dict] = {}
+        self.list_user_stories_calls: list[tuple[int, dict[str, Any]]] = []
         self.story_details: dict[int, dict] = {}
         self.epic_details: dict[int, dict] = {}
         self.task_details: dict[int, dict] = {}
@@ -62,6 +65,29 @@ class DummyTaigaClient:
         if error:
             raise error
         return list(self.epics_by_project.get(project_id, []))
+
+    async def list_user_stories(
+        self,
+        project_id: int,
+        *,
+        epic: int | None = None,
+        q: str | None = None,
+        tags: list[str] | None = None,
+        page: int | None = None,
+        page_size: int | None = None,
+    ) -> list[dict]:
+        error = self.raise_map.get("list_user_stories")
+        if error:
+            raise error
+        params = {
+            "epic": epic,
+            "q": q,
+            "tags": tags,
+            "page": page,
+            "page_size": page_size,
+        }
+        self.list_user_stories_calls.append((project_id, params))
+        return list(self.user_stories_by_project.get(project_id, []))
 
     async def list_user_story_statuses(self, project_id: int) -> list[dict]:
         error = self.raise_map.get("list_user_story_statuses")
@@ -363,6 +389,62 @@ def test_list_projects_forwards_query_params(proxy_client):
 
     assert response.status_code == 200
     assert fake_client.list_projects_params == {"member": "12"}
+
+
+def test_list_user_stories_requires_project_id(proxy_client):
+    client, _ = proxy_client
+
+    response = client.get(
+        "/actions/list_stories",
+        headers={"X-Api-Key": "secret"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "project_id is required"
+
+
+def test_list_user_stories_passes_filters(proxy_client):
+    client, fake_client = proxy_client
+    fake_client.user_stories_by_project[99] = [
+        {
+            "id": 1,
+            "ref": 10,
+            "subject": "Review prior art",
+            "tags": ["ip", "legal"],
+            "project": 99,
+        }
+    ]
+
+    response = client.get(
+        "/actions/list_stories?project_id=99&epic_id=5&search=prior%20art&tag=ip&tag=legal&page=2&page_size=50",
+        headers={"X-Api-Key": "secret"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["stories"][0]["subject"] == "Review prior art"
+    project_id, params = fake_client.list_user_stories_calls.pop()
+    assert project_id == 99
+    assert params == {
+        "epic": 5,
+        "q": "prior art",
+        "tags": ["ip", "legal"],
+        "page": 2,
+        "page_size": 50,
+    }
+
+
+def test_list_user_stories_translates_taiga_errors(proxy_client):
+    client, fake_client = proxy_client
+    fake_client.raise_map["list_user_stories"] = TaigaAPIError("Taiga says no")
+
+    response = client.get(
+        "/actions/list_stories?project_id=1",
+        headers={"X-Api-Key": "secret"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "Taiga says no"
 
 
 def test_create_story_validates_required_fields(proxy_client):

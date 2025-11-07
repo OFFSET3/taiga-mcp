@@ -71,6 +71,23 @@ def _cmd_list_epics(client: httpx.Client, args: argparse.Namespace) -> Any:
     return _handle_response(response)
 
 
+def _cmd_list_stories(client: httpx.Client, args: argparse.Namespace) -> Any:
+    params: list[tuple[str, Any]] = [("project_id", args.project_id)]
+    if args.epic_id is not None:
+        params.append(("epic_id", args.epic_id))
+    if args.search:
+        params.append(("search", args.search))
+    if args.page is not None:
+        params.append(("page", args.page))
+    if args.page_size is not None:
+        params.append(("page_size", args.page_size))
+    if args.tags:
+        for tag in args.tags:
+            params.append(("tag", tag))
+    response = client.get("/actions/list_stories", params=params)
+    return _handle_response(response)
+
+
 def _cmd_list_statuses(client: httpx.Client, args: argparse.Namespace) -> Any:
     params = {"project_id": args.project_id}
     response = client.get("/actions/statuses", params=params)
@@ -307,6 +324,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project identifier (repeatable)",
     )
     list_epics.set_defaults(func=_cmd_list_epics)
+
+    list_stories = subparsers.add_parser("list-stories", help="List user stories for a project")
+    list_stories.add_argument("--project-id", type=int, required=True)
+    list_stories.add_argument("--epic-id", type=int, help="Filter by epic identifier")
+    list_stories.add_argument("--search", help="Search query for subject/description")
+    list_stories.add_argument("--tag", dest="tags", action="append", help="Repeat to filter by tag")
+    list_stories.add_argument("--page", type=int, help="Page number for pagination")
+    list_stories.add_argument("--page-size", type=int, help="Page size for pagination")
+    list_stories.set_defaults(func=_cmd_list_stories)
 
     list_statuses = subparsers.add_parser("list-statuses", help="List user story statuses for a project")
     list_statuses.add_argument("--project-id", type=int, required=True, help="Project identifier")

@@ -29,6 +29,7 @@
 - `echo(message)` — diagnostic helper that returns the provided message.
 - `taiga.projects.list(search?)` — lists projects where the service account is a member (optional case-insensitive substring search, scoped by the authenticated user id).
 - `taiga.epics.list(project_id)` — lists epics for a project, including id/ref/subject/status metadata.
+- `taiga.stories.list(project_id, search?, epic_id?, tags?, page?, page_size?)` — lists user stories for a project with optional filters for text search, epic membership, tags, and pagination.
 - `taiga.stories.create(project_id, subject, description?, status?, tags?, assigned_to?)` — creates a Taiga user story; `status` accepts either an id or status name/slug.
 - `taiga.epics.add_user_story(epic_id, user_story_id)` — links a user story to an epic.
 
@@ -40,6 +41,7 @@
   - `GET /actions/get_project?project_id=123` → `{ "project": {...} }` returning the full Taiga project payload for the given id.
   - `GET /actions/get_project_by_slug?slug=acme-backlog` → `{ "project": {...} }` resolving the project via slug.
   - `GET /actions/list_epics?project_id=123&project_id=456` → `{ "epics": [...] }` including the originating `project_id` for each epic.
+  - `GET /actions/list_stories?project_id=123&epic_id=456&search=prior+art&tag=ip` → `{ "stories": [...] }` filtered by project, epic, keywords, tags, and optional pagination (`page`/`page_size`).
   - `GET /actions/statuses?project_id=123` → `{ "statuses": [...] }` to drive status pickers.
   - `POST /actions/create_story` → `{ "story": {...} }`; accepts the same payload as the MCP tool and resolves status slugs/names.
   - `POST /actions/update_story` → `{ "story": {...} }`; accepts `story_id` plus any combination of `project_id`, `subject`, `description`, `status`, `tags`, `assigned_to` (status strings resolve to ids automatically).
@@ -109,6 +111,15 @@
   - `TAIGA_PASSWORD` — service account password.
   - `ACTION_PROXY_API_KEY` — shared secret used by the `/actions/*` endpoints.
 - Rotate credentials regularly and redeploy so that new revisions pick up the changes.
+
+## Connecting MCP Clients
+- You are expected to deploy and host your own MCP server instance (for example on Azure Container Apps, Docker Desktop, or any other Python hosting target). This repository does not expose a shared public endpoint.
+- ChatGPT Custom GPT setup:
+  - Open the GPT Builder UI, choose **Create**, and select **Configure** → **Add** under the Model Context Protocol tools section.
+  - Enter your deployed Streamable HTTP URL (for example `https://your-domain.example/mcp`) as the endpoint and leave headers/body blank unless you have protected the route behind a proxy.
+  - Save the GPT and test the `echo` tool to confirm connectivity. The session will reuse your deployed server on each invocation.
+- Open-source MCP clients (such as the `mcp` Python CLI or Claude Desktop) can target the same `/mcp` endpoint; set `MCP_URL` to your deployed URL before running helper scripts like `streamable_client.py`.
+- If you regenerate the container image, existing environment variables and secret references remain attached to the Container App. Only set them again when new keys/variables are introduced or when credentials rotate.
 
 ## Verification Checklist
 - Streamable HTTP smoke test:

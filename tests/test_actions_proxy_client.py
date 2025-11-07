@@ -69,6 +69,50 @@ def test_list_projects_invokes_get(dummy_client, capsys):
     assert payload["params"] == {"search": "alpha"}
 
 
+def test_list_stories_invokes_get(dummy_client, capsys):
+    cli.main([
+        "--base-url",
+        "https://example.com",
+        "--api-key",
+        "secret",
+        "--pretty",
+        "list-stories",
+        "--project-id",
+        "77",
+        "--epic-id",
+        "5",
+        "--search",
+        "prior art",
+        "--tag",
+        "ip",
+        "--tag",
+        "legal",
+        "--page",
+        "2",
+        "--page-size",
+        "25",
+    ])
+
+    call = dummy_client.calls.pop()
+    assert call == (
+        "GET",
+        "/actions/list_stories",
+        [
+            ("project_id", 77),
+            ("epic_id", 5),
+            ("search", "prior art"),
+            ("page", 2),
+            ("page_size", 25),
+            ("tag", "ip"),
+            ("tag", "legal"),
+        ],
+    )
+    out, err = capsys.readouterr()
+    assert err == ""
+    payload = json.loads(out)
+    assert payload["ok"] is True
+
+
 def test_get_project_invokes_get(dummy_client, capsys):
     cli.main([
         "--base-url",

@@ -223,6 +223,72 @@ async def _list_epics_action(request: Request) -> JSONResponse:
     return JSONResponse({"epics": epics})
 
 
+async def _list_user_stories_action(request: Request) -> JSONResponse:
+    if (error := _verify_api_key(request)) is not None:
+        return error
+
+    project_id_param = request.query_params.get("project_id")
+    if not project_id_param:
+        return _error_response("project_id is required", 400)
+
+    try:
+        project_id = _parse_int(project_id_param, "project_id")
+    except ValueError as exc:
+        return _error_response(str(exc), 400)
+
+    epic_param = request.query_params.get("epic_id") or request.query_params.get("epic")
+    try:
+        epic_id = _optional_int(epic_param, "epic_id")
+    except ValueError as exc:
+        return _error_response(str(exc), 400)
+
+    search = request.query_params.get("search") or request.query_params.get("q")
+
+    tags = request.query_params.getlist("tag")
+    if not tags:
+        tags = request.query_params.getlist("tags")
+
+    try:
+        page = _optional_int(request.query_params.get("page"), "page")
+        page_size = _optional_int(request.query_params.get("page_size"), "page_size")
+    except ValueError as exc:
+        return _error_response(str(exc), 400)
+
+    try:
+        stories = await _call_taiga(
+            lambda client: client.list_user_stories(
+                project_id,
+                epic=epic_id,
+                q=search,
+                tags=tags or None,
+                page=page,
+                page_size=page_size,
+            )
+        )
+    except TaigaAPIError as exc:
+        return _error_response(str(exc), 400)
+    except Exception:  # pragma: no cover - safety net
+        logger.exception("Unexpected error while listing user stories")
+        return _error_response("Internal server error", 500)
+
+    keep = (
+        "id",
+        "ref",
+        "subject",
+        "description",
+        "project",
+        "epic",
+        "epics",
+        "tags",
+        "status",
+        "status_extra_info",
+        "assigned_to",
+        "created_date",
+        "modified_date",
+    )
+    return JSONResponse({"stories": [_slice(story, keep) for story in stories]})
+
+
 async def _list_statuses_action(request: Request) -> JSONResponse:
     if (error := _verify_api_key(request)) is not None:
         return error
@@ -1200,6 +1266,47 @@ async def _resolve_status_id(client, project_id: int, status: int | str | None) 
 
 
 @mcp.tool(
+    name="taiga.stories.list",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_stories_list(
+    project_id: int,
+    search: str | None = None,
+    epic_id: int | None = None,
+    tags: list[str] | None = None,
+    page: int | None = None,
+    page_size: int | None = None,
+) -> list[dict[str, Any]]:
+    """List user stories for a Taiga project with optional filters."""
+
+    async with get_taiga_client() as client:
+        stories = await client.list_user_stories(
+            project_id,
+            epic=epic_id,
+            q=search,
+            tags=tags,
+            page=page,
+            page_size=page_size,
+        )
+    keep = (
+        "id",
+        "ref",
+        "subject",
+        "description",
+        "project",
+        "epic",
+        "epics",
+        "tags",
+        "status",
+        "status_extra_info",
+        "assigned_to",
+        "created_date",
+        "modified_date",
+    )
+    return [_slice(story, keep) for story in stories]
+
+
+@mcp.tool(
     name="taiga.stories.create",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
@@ -1281,6 +1388,7 @@ app = Starlette(
         Route("/actions/get_project", _get_project_action, methods=["GET"]),
         Route("/actions/get_project_by_slug", _get_project_by_slug_action, methods=["GET"]),
         Route("/actions/list_epics", _list_epics_action, methods=["GET"]),
+    Route("/actions/list_stories", _list_user_stories_action, methods=["GET"]),
         Route("/actions/statuses", _list_statuses_action, methods=["GET"]),
         Route("/actions/create_story", _create_story_action, methods=["POST"]),
         Route("/actions/add_story_to_epic", _add_story_to_epic_action, methods=["POST"]),

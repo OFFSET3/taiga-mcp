@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Mapping, Sequence
 
 import httpx
 from httpx._types import QueryParamTypes
@@ -136,6 +136,32 @@ class TaigaClient:
     async def list_epics(self, project_id: int) -> list[dict[str, Any]]:
         params = {"project": project_id}
         data = await self._request("GET", "/epics", params=params)
+        return list(data)
+
+    async def list_user_stories(
+        self,
+        project_id: int,
+        *,
+        epic: int | None = None,
+        q: str | None = None,
+        tags: Sequence[str] | None = None,
+        page: int | None = None,
+        page_size: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: list[tuple[str, Any]] = [("project", project_id)]
+        if epic is not None:
+            params.append(("epic", epic))
+        if q:
+            params.append(("q", q))
+        if tags:
+            for tag in tags:
+                params.append(("tags", tag))
+        if page is not None:
+            params.append(("page", page))
+        if page_size is not None:
+            params.append(("page_size", page_size))
+
+        data = await self._request("GET", "/userstories", params=params)
         return list(data)
 
     async def list_user_story_statuses(self, project_id: int) -> list[dict[str, Any]]:
