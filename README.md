@@ -100,6 +100,8 @@
   - `$env:AZURE_CONTAINER_APP = 'taiga-mcp'`
 - Deploy the new revision (after pushing the image):
   - `az containerapp update -g $env:AZURE_RESOURCE_GROUP -n $env:AZURE_CONTAINER_APP --image "$CONTAINER_IMAGE:$IMAGE_TAG"`
+- Or run the helper script (builds, pushes, and deploys in one step; honours the same env vars):
+  - `python scripts/deploy_to_azure.py`
 - Helpful Windows settings (avoid WinError 5 permission issues):
   - `$env:AZURE_EXTENSION_DIR = Join-Path $HOME '.az-extensions'`
   - `$env:AZURE_CONFIG_DIR = Join-Path $HOME '.az-cli'`
