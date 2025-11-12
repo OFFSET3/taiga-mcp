@@ -1,6 +1,10 @@
+import asyncio
+import datetime
+import hashlib
 import logging
 import os
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from json import JSONDecodeError
@@ -108,6 +112,47 @@ ActionCall = Callable[[Any], Awaitable[Any]]
 async def _call_taiga(action: ActionCall) -> Any:
     async with get_taiga_client() as client:
         return await action(client)
+
+
+class _UnsetType:
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return "UNSET"
+
+
+UNSET = _UnsetType()
+
+
+class _IdempotencyStore:
+    def __init__(self, ttl_seconds: int = 24 * 60 * 60) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._lock = asyncio.Lock()
+        self._entries: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    async def get(self, key: str) -> dict[str, Any] | None:
+        async with self._lock:
+            self._purge_expired()
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            _, value = entry
+            return dict(value)
+
+    async def store(self, key: str, value: dict[str, Any]) -> None:
+        async with self._lock:
+            self._purge_expired()
+            expires_at = time.time() + self._ttl_seconds
+            self._entries[key] = (expires_at, dict(value))
+
+    def _purge_expired(self) -> None:
+        now = time.time()
+        expired = [cache_key for cache_key, (expires_at, _) in self._entries.items() if expires_at <= now]
+        for cache_key in expired:
+            self._entries.pop(cache_key, None)
+
+
+_IDEMPOTENCY_STORE = _IdempotencyStore()
 
 
 async def _list_projects_action(request: Request) -> JSONResponse:
@@ -391,7 +436,7 @@ async def _create_story_with_client(
     tags: list[str] | None,
     assigned_to: int | None,
 ) -> dict[str, Any]:
-    status_id = await _resolve_status_id(client, project_id, status)
+    status_id = await _resolve_user_story_status_id(client, project_id, status)
     payload: dict[str, Any] = {
         "project": project_id,
         "subject": subject,
@@ -552,7 +597,7 @@ async def _update_story_with_client(
         elif isinstance(status, str):
             if project_id_for_status is None:
                 raise TaigaAPIError("Unable to resolve project for story status lookup")
-            status_id = await _resolve_status_id(client, project_id_for_status, status)
+            status_id = await _resolve_user_story_status_id(client, project_id_for_status, status)
             update_payload["status"] = status_id
         else:
             raise TaigaAPIError("status must be an integer or string")
@@ -1252,7 +1297,22 @@ async def taiga_epics_list(project_id: int) -> list[dict[str, Any]]:
     return [_slice(epic, keep) for epic in epics]
 
 
-async def _resolve_status_id(client, project_id: int, status: int | str | None) -> int | None:
+def _make_idempotency_cache_key(raw_key: str, user_story_id: int, subject: str) -> str:
+    digest = hashlib.sha256(f"{user_story_id}:{subject}".encode("utf-8")).hexdigest()
+    return f"{raw_key}:{digest}"
+
+
+def _validate_due_date(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("due_date must be in YYYY-MM-DD format") from exc
+    return parsed.isoformat()
+
+
+async def _resolve_user_story_status_id(client, project_id: int, status: int | str | None) -> int | None:
     if status is None:
         return None
     if isinstance(status, int):
@@ -1263,6 +1323,19 @@ async def _resolve_status_id(client, project_id: int, status: int | str | None) 
         if entry.get("name") == status or entry.get("slug") == status:
             return entry.get("id")
     raise TaigaAPIError(f"Status '{status}' not found for project {project_id}")
+
+
+async def _resolve_task_status_id(client, project_id: int, status: int | str | None) -> int | None:
+    if status is None:
+        return None
+    if isinstance(status, int):
+        return status
+
+    statuses = await client.list_task_statuses(project_id)
+    for entry in statuses:
+        if entry.get("name") == status or entry.get("slug") == status:
+            return entry.get("id")
+    raise TaigaAPIError(f"Task status '{status}' not found for project {project_id}")
 
 
 @mcp.tool(
@@ -1321,7 +1394,7 @@ async def taiga_stories_create(
     """Create a user story in Taiga and return the created record."""
 
     async with get_taiga_client() as client:
-        status_id = await _resolve_status_id(client, project_id, status)
+        status_id = await _resolve_user_story_status_id(client, project_id, status)
         payload: dict[str, Any] = {
             "project": project_id,
             "subject": subject,
@@ -1353,6 +1426,93 @@ async def taiga_stories_create(
 
 
 @mcp.tool(
+    name="taiga.stories.update",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_stories_update(
+    user_story_id: int,
+    subject: str | None | _UnsetType = UNSET,
+    description: str | None | _UnsetType = UNSET,
+    status: int | str | None | _UnsetType = UNSET,
+    tags: list[str] | None | _UnsetType = UNSET,
+    assigned_to: int | None | _UnsetType = UNSET,
+    epic_id: int | None | _UnsetType = UNSET,
+    milestone_id: int | None | _UnsetType = UNSET,
+    custom_attributes: dict[str, Any] | None | _UnsetType = UNSET,
+    version: int | None | _UnsetType = UNSET,
+) -> dict[str, Any]:
+    """Update a Taiga user story with partial field semantics."""
+
+    async with get_taiga_client() as client:
+        existing = await client.get_user_story(user_story_id)
+        project_raw = existing.get("project")
+        try:
+            project_id = int(project_raw)
+        except (TypeError, ValueError):
+            raise TaigaAPIError("Unable to resolve project for story update") from None
+
+        payload: dict[str, Any] = {}
+        has_updates = False
+
+        if subject is not UNSET:
+            payload["subject"] = subject
+            has_updates = True
+        if description is not UNSET:
+            payload["description"] = description
+            has_updates = True
+        if tags is not UNSET:
+            payload["tags"] = [] if tags is None else tags
+            has_updates = True
+        if assigned_to is not UNSET:
+            payload["assigned_to"] = assigned_to
+            has_updates = True
+        if epic_id is not UNSET:
+            payload["epic"] = epic_id
+            has_updates = True
+        if milestone_id is not UNSET:
+            payload["milestone"] = milestone_id
+            has_updates = True
+        if custom_attributes is not UNSET:
+            payload["custom_attributes"] = custom_attributes
+            has_updates = True
+
+        if status is not UNSET:
+            if status is None:
+                payload["status"] = None
+            else:
+                status_id = await _resolve_user_story_status_id(client, project_id, status)
+                payload["status"] = status_id
+            has_updates = True
+
+        if not has_updates:
+            raise ValueError("At least one field must be provided to update the story")
+
+        if version is UNSET or version is None:
+            version_value = existing.get("version")
+            if version_value is None:
+                raise TaigaAPIError("Unable to resolve version for story update")
+            try:
+                payload["version"] = int(version_value)
+            except (TypeError, ValueError):
+                raise TaigaAPIError("Unable to resolve version for story update") from None
+        else:
+            payload["version"] = int(version)
+
+        try:
+            updated = await client.update_user_story(user_story_id, payload)
+        except TaigaAPIError as exc:
+            if exc.status_code == 409:
+                latest = await client.get_user_story(user_story_id)
+                latest_version = latest.get("version")
+                raise ValueError(
+                    f"Conflict updating user story {user_story_id}: latest version is {latest_version}"
+                ) from exc
+            raise
+
+    return dict(updated)
+
+
+@mcp.tool(
     name="taiga.epics.add_user_story",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
@@ -1362,6 +1522,279 @@ async def taiga_epics_add_user_story(epic_id: int, user_story_id: int) -> dict[s
     async with get_taiga_client() as client:
         response = await client.link_epic_user_story(epic_id, user_story_id)
     return response
+
+
+@mcp.tool(
+    name="taiga.tasks.create",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_tasks_create(
+    user_story_id: int,
+    subject: str,
+    description: str | None | _UnsetType = UNSET,
+    assigned_to: int | None | _UnsetType = UNSET,
+    status: int | str | None | _UnsetType = UNSET,
+    tags: list[str] | None | _UnsetType = UNSET,
+    due_date: str | None | _UnsetType = UNSET,
+    idempotency_key: str | None | _UnsetType = UNSET,
+) -> dict[str, Any]:
+    """Create a task for a Taiga user story."""
+
+    cache_key: str | None = None
+
+    async with get_taiga_client() as client:
+        story = await client.get_user_story(user_story_id)
+        project_raw = story.get("project")
+        try:
+            project_id = int(project_raw)
+        except (TypeError, ValueError):
+            raise TaigaAPIError("Unable to resolve project for task creation") from None
+
+        if idempotency_key is not UNSET and idempotency_key:
+            cache_key = _make_idempotency_cache_key(idempotency_key, user_story_id, subject)
+            cached = await _IDEMPOTENCY_STORE.get(cache_key)
+            if cached is not None:
+                return cached
+
+        payload: dict[str, Any] = {
+            "project": project_id,
+            "user_story": user_story_id,
+            "subject": subject,
+        }
+
+        if description is not UNSET:
+            payload["description"] = description
+        if assigned_to is not UNSET:
+            payload["assigned_to"] = assigned_to
+        if tags is not UNSET:
+            payload["tags"] = [] if tags is None else tags
+        if due_date is not UNSET:
+            payload["due_date"] = _validate_due_date(due_date)
+        if status is not UNSET:
+            if status is None:
+                payload["status"] = None
+            else:
+                status_id = await _resolve_task_status_id(client, project_id, status)
+                payload["status"] = status_id
+
+        task = await client.create_task(payload)
+
+        if cache_key:
+            await _IDEMPOTENCY_STORE.store(cache_key, dict(task))
+
+    return dict(task)
+
+
+@mcp.tool(
+    name="taiga.tasks.update",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_tasks_update(
+    task_id: int,
+    subject: str | None | _UnsetType = UNSET,
+    description: str | None | _UnsetType = UNSET,
+    assigned_to: int | None | _UnsetType = UNSET,
+    status: int | str | None | _UnsetType = UNSET,
+    tags: list[str] | None | _UnsetType = UNSET,
+    due_date: str | None | _UnsetType = UNSET,
+    version: int | None | _UnsetType = UNSET,
+) -> dict[str, Any]:
+    """Update fields on an existing Taiga task."""
+
+    async with get_taiga_client() as client:
+        existing = await client.get_task(task_id)
+        project_raw = existing.get("project")
+        try:
+            project_id = int(project_raw)
+        except (TypeError, ValueError):
+            raise TaigaAPIError("Unable to resolve project for task update") from None
+
+        payload: dict[str, Any] = {}
+        has_updates = False
+
+        if subject is not UNSET:
+            payload["subject"] = subject
+            has_updates = True
+        if description is not UNSET:
+            payload["description"] = description
+            has_updates = True
+        if assigned_to is not UNSET:
+            payload["assigned_to"] = assigned_to
+            has_updates = True
+        if tags is not UNSET:
+            payload["tags"] = [] if tags is None else tags
+            has_updates = True
+        if due_date is not UNSET:
+            payload["due_date"] = _validate_due_date(due_date)
+            has_updates = True
+        if status is not UNSET:
+            if status is None:
+                payload["status"] = None
+            else:
+                status_id = await _resolve_task_status_id(client, project_id, status)
+                payload["status"] = status_id
+            has_updates = True
+
+        if not has_updates:
+            raise ValueError("At least one field must be provided to update the task")
+
+        if version is UNSET or version is None:
+            version_value = existing.get("version")
+            if version_value is None:
+                raise TaigaAPIError("Unable to resolve version for task update")
+            try:
+                payload["version"] = int(version_value)
+            except (TypeError, ValueError):
+                raise TaigaAPIError("Unable to resolve version for task update") from None
+        else:
+            payload["version"] = int(version)
+
+        try:
+            updated = await client.update_task(task_id, payload)
+        except TaigaAPIError as exc:
+            if exc.status_code == 409:
+                latest = await client.get_task(task_id)
+                latest_version = latest.get("version")
+                raise ValueError(
+                    f"Conflict updating task {task_id}: latest version is {latest_version}"
+                ) from exc
+            raise
+
+    return dict(updated)
+
+
+@mcp.tool(
+    name="taiga.tasks.list",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_tasks_list(
+    project_id: int | None | _UnsetType = UNSET,
+    user_story_id: int | None | _UnsetType = UNSET,
+    assigned_to: int | None | _UnsetType = UNSET,
+    search: str | None | _UnsetType = UNSET,
+    status: int | str | None | _UnsetType = UNSET,
+    page: int | None | _UnsetType = UNSET,
+    page_size: int | None | _UnsetType = UNSET,
+) -> dict[str, Any]:
+    """List tasks with optional filters and pagination metadata."""
+
+    project_filter = None if project_id is UNSET else project_id
+    user_story_filter = None if user_story_id is UNSET else user_story_id
+    assigned_filter = None if assigned_to is UNSET else assigned_to
+    search_filter = None if search is UNSET else search
+    page_filter = None if page is UNSET else page
+    page_size_filter = None if page_size is UNSET else page_size
+
+    async with get_taiga_client() as client:
+        resolved_status: int | None = None
+        if status is not UNSET:
+            if status is None:
+                resolved_status = None
+            elif isinstance(status, str):
+                if project_filter is None:
+                    raise ValueError("project_id is required when filtering by status name")
+                try:
+                    project_for_status = int(project_filter)
+                except (TypeError, ValueError):
+                    raise TaigaAPIError("Unable to resolve project for task status lookup") from None
+                resolved_status = await _resolve_task_status_id(client, project_for_status, status)
+            else:
+                resolved_status = status
+
+        tasks, pagination = await client.list_tasks(
+            project_id=project_filter,
+            user_story_id=user_story_filter,
+            assigned_to=assigned_filter,
+            search=search_filter,
+            status=resolved_status,
+            page=page_filter,
+            page_size=page_size_filter,
+        )
+
+    keep = (
+        "id",
+        "ref",
+        "subject",
+        "project",
+        "user_story",
+        "status",
+        "description",
+        "assigned_to",
+        "tags",
+        "due_date",
+        "created_date",
+        "modified_date",
+        "version",
+    )
+    filtered_tasks = [_slice(task, keep) for task in tasks]
+    return {"tasks": filtered_tasks, "pagination": pagination}
+
+
+@mcp.tool(
+    name="taiga.users.list",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_users_list(search: str | None | _UnsetType = UNSET) -> list[dict[str, Any]]:
+    """List Taiga users to support ID resolution."""
+
+    search_filter = None if search is UNSET else search
+    async with get_taiga_client() as client:
+        users = await client.list_users(search=search_filter or None)
+
+    keep = ("id", "full_name", "username", "email")
+    results = [_slice(user, keep) for user in users]
+
+    if search_filter:
+        lowered = search_filter.lower()
+        results = [
+            user
+            for user in results
+            if any(
+                isinstance(value, str) and lowered in value.lower()
+                for value in (user.get("full_name"), user.get("username"), user.get("email"))
+            )
+        ]
+
+    return results
+
+
+@mcp.tool(
+    name="taiga.milestones.list",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_milestones_list(
+    project_id: int,
+    search: str | None | _UnsetType = UNSET,
+) -> list[dict[str, Any]]:
+    """List milestones for a project with optional search filtering."""
+
+    search_filter = None if search is UNSET else search
+
+    async with get_taiga_client() as client:
+        milestones = await client.list_milestones(project_id)
+
+    keep = (
+        "id",
+        "name",
+        "slug",
+        "estimated_start",
+        "estimated_finish",
+        "closed",
+        "project",
+    )
+
+    filtered: list[dict[str, Any]] = []
+    for milestone in milestones:
+        entry = _slice(milestone, keep)
+        if search_filter:
+            lowered = search_filter.lower()
+            name = (entry.get("name") or "").lower()
+            slug = (entry.get("slug") or "").lower()
+            if lowered not in name and lowered not in slug:
+                continue
+        filtered.append(entry)
+
+    return filtered
 
 
 async def healthz(_):
