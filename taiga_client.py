@@ -7,7 +7,35 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Mapping, Sequence
 
 import httpx
+from httpx import Response
 from httpx._types import QueryParamTypes
+
+
+def _safe_json(response: Response) -> Any | None:
+    try:
+        return response.json()
+    except ValueError:  # pragma: no cover - defensive fallback
+        text = response.text
+        return text if text else None
+
+
+def _extract_pagination(headers: Mapping[str, str]) -> dict[str, Any]:
+    mapping = {
+        "x-pagination-page": "page",
+        "x-pagination-page-size": "page_size",
+        "x-pagination-total": "total",
+        "x-pagination-pages": "total_pages",
+    }
+    pagination: dict[str, Any] = {}
+    for header_name, field in mapping.items():
+        value = headers.get(header_name)
+        if value is None:
+            continue
+        try:
+            pagination[field] = int(value)
+        except ValueError:  # pragma: no cover - leave raw value for diagnostics
+            pagination[field] = value
+    return pagination
 
 __all__ = [
     "TaigaAPIError",
@@ -17,6 +45,11 @@ __all__ = [
 
 class TaigaAPIError(RuntimeError):
     """Raised when the Taiga API responds with an error."""
+
+    def __init__(self, message: str, *, status_code: int | None = None, payload: Any | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload
 
 
 def _require_env(name: str) -> str:
@@ -62,7 +95,9 @@ class TaigaClient:
         except httpx.HTTPStatusError as exc:  # pragma: no cover - error details for humans
             detail = exc.response.text
             raise TaigaAPIError(
-                f"Taiga authentication failed with status {exc.response.status_code}: {detail}"
+                f"Taiga authentication failed with status {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+                payload=_safe_json(exc.response),
             ) from exc
 
         try:
@@ -95,7 +130,9 @@ class TaigaClient:
         except httpx.HTTPStatusError as exc:  # pragma: no cover - error details for humans
             detail = exc.response.text
             raise TaigaAPIError(
-                f"Taiga API request failed with status {exc.response.status_code}: {detail}"
+                f"Taiga API request failed with status {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+                payload=_safe_json(exc.response),
             ) from exc
         if response.content:
             return response.json()
@@ -169,6 +206,11 @@ class TaigaClient:
         data = await self._request("GET", "/userstory-statuses", params=params)
         return list(data)
 
+    async def list_task_statuses(self, project_id: int) -> list[dict[str, Any]]:
+        params = {"project": project_id}
+        data = await self._request("GET", "/task-statuses", params=params)
+        return list(data)
+
     async def create_user_story(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         data = await self._request("POST", "/userstories", json=payload)
         return dict(data)
@@ -226,6 +268,47 @@ class TaigaClient:
     async def delete_task(self, task_id: int) -> None:
         await self._request("DELETE", f"/tasks/{task_id}")
 
+    async def list_tasks(
+        self,
+        *,
+        project_id: int | None = None,
+        user_story_id: int | None = None,
+        assigned_to: int | None = None,
+        search: str | None = None,
+        status: int | None = None,
+        page: int | None = None,
+        page_size: int | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        params: list[tuple[str, Any]] = []
+        if project_id is not None:
+            params.append(("project", project_id))
+        if user_story_id is not None:
+            params.append(("user_story", user_story_id))
+        if assigned_to is not None:
+            params.append(("assigned_to", assigned_to))
+        if search:
+            params.append(("q", search))
+        if status is not None:
+            params.append(("status", status))
+        if page is not None:
+            params.append(("page", page))
+        if page_size is not None:
+            params.append(("page_size", page_size))
+
+        response = await self._client.get("/tasks", params=params or None)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:  # pragma: no cover - error details for humans
+            raise TaigaAPIError(
+                f"Taiga API request failed with status {exc.response.status_code}: {exc.response.text}",
+                status_code=exc.response.status_code,
+                payload=_safe_json(exc.response),
+            ) from exc
+
+        pagination = _extract_pagination(response.headers)
+        data = response.json() if response.content else []
+        return list(data), pagination
+
     async def create_issue(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         data = await self._request("POST", "/issues", json=payload)
         return dict(data)
@@ -240,6 +323,16 @@ class TaigaClient:
 
     async def delete_issue(self, issue_id: int) -> None:
         await self._request("DELETE", f"/issues/{issue_id}")
+
+    async def list_users(self, *, search: str | None = None) -> list[dict[str, Any]]:
+        params = {"search": search} if search else None
+        data = await self._request("GET", "/users", params=params)
+        return list(data)
+
+    async def list_milestones(self, project_id: int) -> list[dict[str, Any]]:
+        params = {"project": project_id}
+        data = await self._request("GET", "/milestones", params=params)
+        return list(data)
 
 
 @asynccontextmanager
