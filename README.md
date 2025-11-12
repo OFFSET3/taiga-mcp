@@ -28,10 +28,17 @@
 ## MCP Tools
 - `echo(message)` — diagnostic helper that returns the provided message.
 - `taiga.projects.list(search?)` — lists projects where the service account is a member (optional case-insensitive substring search, scoped by the authenticated user id).
+- `taiga.projects.get(project_id?, slug?)` — fetches a project record either by numeric identifier or slug (one of the two inputs is required).
 - `taiga.epics.list(project_id)` — lists epics for a project, including id/ref/subject/status metadata.
 - `taiga.stories.list(project_id, search?, epic_id?, tags?, page?, page_size?)` — lists user stories for a project with optional filters for text search, epic membership, tags, and pagination.
 - `taiga.stories.create(project_id, subject, description?, status?, tags?, assigned_to?)` — creates a Taiga user story; `status` accepts either an id or status name/slug.
+- `taiga.stories.update(user_story_id, subject?, description?, status?, tags?, assigned_to?, epic_id?, milestone_id?, custom_attributes?, version?)` — updates an existing story with optimistic concurrency checks and server-side status resolution.
 - `taiga.epics.add_user_story(epic_id, user_story_id)` — links a user story to an epic.
+- `taiga.tasks.create(user_story_id, subject, description?, assigned_to?, status?, tags?, due_date?, idempotency_key?)` — creates a Taiga task under a story, applying status lookups and idempotency safeguards.
+- `taiga.tasks.update(task_id, subject?, description?, assigned_to?, status?, tags?, due_date?, version?)` — updates a task with the same optimistic concurrency handling as stories.
+- `taiga.tasks.list(project_id?, user_story_id?, assigned_to?, search?, status?, page?, page_size?)` — lists tasks with flexible filters and pagination metadata, resolving status names when a `project_id` is supplied.
+- `taiga.users.list(search?)` — finds Taiga users by substring matching against full name, username, or email to support assignee resolution.
+- `taiga.milestones.list(project_id, search?)` — returns milestones/sprints for a project, allowing optional name/slug filtering.
 
 ## Action Proxy Surface
 - Purpose: provide a lightweight HTTP bridge for Taiga automation while MCP write tools stay allowlisted.
