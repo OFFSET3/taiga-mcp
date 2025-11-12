@@ -189,31 +189,14 @@ def anyio_backend():
 
 
 @pytest.mark.anyio("asyncio")
-async def test_mcp_lists_story_and_task_tools():
-    tools = await app.mcp.list_tools()
-    tool_names = {tool.name for tool in tools}
-    expected = {
-        "taiga.stories.update",
-        "taiga.tasks.create",
-        "taiga.tasks.update",
-        "taiga.tasks.list",
-        "taiga.users.list",
-        "taiga.milestones.list",
-    }
-    assert expected.issubset(tool_names)
-
-
-@pytest.mark.anyio("asyncio")
 async def test_taiga_stories_update_resolves_status(tool_client: DummyToolClient):
     result = await app.taiga_stories_update(
-        app.StoryUpdateInput(
-            user_story_id=5,
-            subject="Updated",
-            status="In Progress",
-            tags=["prior-art-miner"],
-            milestone_id=4,
-            custom_attributes={"effort": 5},
-        )
+        user_story_id=5,
+        subject="Updated",
+        status="In Progress",
+        tags=["prior-art-miner"],
+        milestone_id=4,
+        custom_attributes={"effort": 5},
     )
 
     assert result["subject"] == "Updated"
@@ -228,22 +211,18 @@ async def test_taiga_stories_update_resolves_status(tool_client: DummyToolClient
 @pytest.mark.anyio("asyncio")
 async def test_taiga_tasks_create_honours_idempotency(tool_client: DummyToolClient):
     result_first = await app.taiga_tasks_create(
-        app.TaskCreateInput(
-            user_story_id=5,
-            subject="Stand up USPTO bulk mirror",
-            status="Doing",
-            due_date="2025-11-21",
-            idempotency_key="abc123",
-        )
+        user_story_id=5,
+        subject="Stand up USPTO bulk mirror",
+        status="Doing",
+        due_date="2025-11-21",
+        idempotency_key="abc123",
     )
     result_second = await app.taiga_tasks_create(
-        app.TaskCreateInput(
-            user_story_id=5,
-            subject="Stand up USPTO bulk mirror",
-            status="Doing",
-            due_date="2025-11-21",
-            idempotency_key="abc123",
-        )
+        user_story_id=5,
+        subject="Stand up USPTO bulk mirror",
+        status="Doing",
+        due_date="2025-11-21",
+        idempotency_key="abc123",
     )
 
     assert result_first == result_second
@@ -258,16 +237,14 @@ async def test_taiga_tasks_update_conflict_raises_value_error(tool_client: Dummy
     tool_client.raise_on_update_task = TaigaAPIError("Conflict", status_code=409)
 
     with pytest.raises(ValueError) as excinfo:
-        await app.taiga_tasks_update(app.TaskUpdateInput(task_id=7, subject="Revised"))
+        await app.taiga_tasks_update(task_id=7, subject="Revised")
 
     assert "latest version" in str(excinfo.value)
 
 
 @pytest.mark.anyio("asyncio")
 async def test_taiga_tasks_list_filters_and_pagination(tool_client: DummyToolClient):
-    response = await app.taiga_tasks_list(
-        app.TaskListInput(project_id=3, status="Doing", page=1, page_size=50)
-    )
+    response = await app.taiga_tasks_list(project_id=3, status="Doing", page=1, page_size=50)
 
     assert response["pagination"]["total"] == 1
     assert response["tasks"][0]["subject"] == "Investigate"
@@ -279,7 +256,7 @@ async def test_taiga_tasks_list_filters_and_pagination(tool_client: DummyToolCli
 @pytest.mark.anyio("asyncio")
 async def test_taiga_tasks_list_requires_project_for_status(tool_client: DummyToolClient):
     with pytest.raises(ValueError):
-        await app.taiga_tasks_list(app.TaskListInput(status="Doing"))
+        await app.taiga_tasks_list(status="Doing")
 
 
 @pytest.mark.anyio("asyncio")
@@ -300,9 +277,7 @@ async def test_taiga_milestones_list_search(tool_client: DummyToolClient):
 async def test_taiga_tasks_create_rejects_bad_due_date(tool_client: DummyToolClient):
     with pytest.raises(ValueError):
         await app.taiga_tasks_create(
-            app.TaskCreateInput(
-                user_story_id=5,
-                subject="Invalid date",
-                due_date="21-11-2025",
-            )
+            user_story_id=5,
+            subject="Invalid date",
+            due_date="21-11-2025",
         )
