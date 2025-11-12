@@ -21,12 +21,12 @@ def _run(command: Sequence[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def _require_value(name: str, value: str | None, flag_name: str) -> str:
+def _require_value(name: str, value: str | None) -> str:
     if value:
         return value
     env_value = os.environ.get(name)
     if not env_value:
-        raise SystemExit(f"Missing required value for {name}. Provide {flag_name} or set {name}.")
+        raise SystemExit(f"Missing required value for {name}. Provide --{name.lower().replace('_', '-')} or set {name}.")
     return env_value
 
 
@@ -47,10 +47,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    image = _require_value("CONTAINER_IMAGE", args.image, "--image")
-    tag = _require_value("IMAGE_TAG", args.tag, "--tag")
-    resource_group = _require_value("AZURE_RESOURCE_GROUP", args.resource_group, "--resource-group")
-    container_app = _require_value("AZURE_CONTAINER_APP", args.container_app, "--container-app")
+    image = _require_value("CONTAINER_IMAGE", args.image)
+    tag = _require_value("IMAGE_TAG", args.tag)
+    resource_group = _require_value("AZURE_RESOURCE_GROUP", args.resource_group)
+    container_app = _require_value("AZURE_CONTAINER_APP", args.container_app)
 
     if not args.skip_build:
         _run(["docker", "build", "-t", f"{image}:{tag}", "-t", f"{image}:{args.latest_tag}", args.context])
