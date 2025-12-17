@@ -89,7 +89,7 @@ class TaigaClient:
             "username": self._username,
             "password": self._password,
         }
-        response = await self._client.post("auth", json=payload)
+        response = await self._client.post("/auth", json=payload)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:  # pragma: no cover - error details for humans

@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from json import JSONDecodeError
 from typing import Any, Sequence
 
+from dotenv import load_dotenv
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -20,6 +21,9 @@ from mcp.types import ToolAnnotations
 
 from taiga_client import TaigaAPIError, get_taiga_client
 from pydantic import BaseModel, ConfigDict
+
+# Load environment variables from .env file
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +337,48 @@ async def _list_user_stories_action(request: Request) -> JSONResponse:
         "modified_date",
     )
     return JSONResponse({"stories": [_slice(story, keep) for story in stories]})
+
+
+async def _get_story_action(request: Request) -> JSONResponse:
+    if (error := _verify_api_key(request)) is not None:
+        return error
+
+    story_id = request.query_params.get("story_id")
+    if not story_id:
+        return _error_response("Missing required parameter: story_id", 400)
+
+    try:
+        story_id_int = int(story_id)
+    except ValueError:
+        return _error_response("story_id must be an integer", 400)
+
+    try:
+        story = await _call_taiga(lambda client: client.get_user_story(story_id_int))
+    except TaigaAPIError as exc:
+        logger.error(f"Taiga API error getting story {story_id_int}: {exc}")
+        return _error_response(str(exc), 400)
+    except Exception:  # pragma: no cover - safety net
+        logger.exception("Unexpected error while getting user story")
+        return _error_response("Internal server error", 500)
+
+    keep = (
+        "id",
+        "ref",
+        "subject",
+        "project",
+        "epics",
+        "tags",
+        "status",
+        "status_extra_info",
+        "assigned_to",
+        "assigned_to_extra_info",
+        "description",
+        "total_points",
+        "created_date",
+        "modified_date",
+        "version",
+    )
+    return JSONResponse({"story": _slice(story, keep)})
 
 
 async def _list_statuses_action(request: Request) -> JSONResponse:
@@ -1841,6 +1887,7 @@ app = Starlette(
         Route("/actions/get_project_by_slug", _get_project_by_slug_action, methods=["GET"]),
         Route("/actions/list_epics", _list_epics_action, methods=["GET"]),
     Route("/actions/list_stories", _list_user_stories_action, methods=["GET"]),
+        Route("/actions/get_story", _get_story_action, methods=["GET"]),
         Route("/actions/statuses", _list_statuses_action, methods=["GET"]),
         Route("/actions/create_story", _create_story_action, methods=["POST"]),
         Route("/actions/add_story_to_epic", _add_story_to_epic_action, methods=["POST"]),
