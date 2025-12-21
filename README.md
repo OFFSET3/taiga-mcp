@@ -1,9 +1,29 @@
 # Taiga MCP Server
 
+**Version:** 1.1.0  
+**Updated:** December 17, 2024
+
 ## Project Overview
 - Implements a Starlette-based Model Context Protocol (MCP) server that exposes both Server-Sent Events (SSE) and Streamable HTTP transports for ChatGPT and other MCP compliant clients.
-- Serves as a bridge between ChatGPT and the Taiga project management API, currently including an `echo` tool for transport validation with ongoing integration of Taiga-specific actions.
+- Serves as a bridge between ChatGPT and the Taiga project management API, providing complete CRUD operations via MCP tools and HTTP action proxy.
 - Deployed as a container workload to Azure Container Apps and packaged for distribution through GitHub Container Registry (GHCR).
+
+## What's New in 1.1.0
+
+### Enhanced CRUD Operations ✅
+- **GET Endpoints:** Added `epics.get`, `stories.get`, `tasks.get` for read-before-write verification
+- **DELETE Endpoints:** Exposed `epics.delete`, `stories.delete`, `tasks.delete` via MCP tools
+- **Append-Only Updates:** `append_description` and `add_tags` parameters for safe collaborative editing
+- **Soft-Delete:** `archive_or_close` helpers for production-safe deletion with audit trails
+- **Pagination Defaults:** `page_size=50` default to prevent large payload safety blocks
+- **Field Control:** `include_details` flag on `epics.list` for minimal vs full field sets
+
+**Documentation:**
+- [TAIGA_MCP_ENHANCEMENTS.md](TAIGA_MCP_ENHANCEMENTS.md) – Comprehensive feature guide
+- [QUICK_REFERENCE.md](QUICK_REFERENCE.md) – Examples and common patterns
+- [ENHANCEMENT_SUMMARY.md](ENHANCEMENT_SUMMARY.md) – Implementation summary
+
+---
 
 ## Configuration
 - Copy `.env.example` to `.env` (or export the variables directly) and fill in values for your Taiga instance, credentials, and deployment settings.
@@ -26,19 +46,35 @@
 - `/mcp/` — Streamable HTTP transport; clients **must** send `Accept: application/json, text/event-stream` to satisfy protocol negotiation.
 
 ## MCP Tools
+
+### Read Operations
 - `echo(message)` — diagnostic helper that returns the provided message.
 - `taiga.projects.list(search?)` — lists projects where the service account is a member (optional case-insensitive substring search, scoped by the authenticated user id).
 - `taiga.projects.get(project_id?, slug?)` — fetches a project record either by numeric identifier or slug (one of the two inputs is required).
-- `taiga.epics.list(project_id)` — lists epics for a project, including id/ref/subject/status metadata.
-- `taiga.stories.list(project_id, search?, epic_id?, tags?, page?, page_size?)` — lists user stories for a project with optional filters for text search, epic membership, tags, and pagination.
-- `taiga.stories.create(project_id, subject, description?, status?, tags?, assigned_to?)` — creates a Taiga user story; `status` accepts either an id or status name/slug.
-- `taiga.stories.update(user_story_id, subject?, description?, status?, tags?, assigned_to?, epic_id?, milestone_id?, custom_attributes?, version?)` — updates an existing story with optimistic concurrency checks and server-side status resolution.
-- `taiga.epics.add_user_story(epic_id, user_story_id)` — links a user story to an epic.
-- `taiga.tasks.create(user_story_id, subject, description?, assigned_to?, status?, tags?, due_date?, idempotency_key?)` — creates a Taiga task under a story, applying status lookups and idempotency safeguards.
-- `taiga.tasks.update(task_id, subject?, description?, assigned_to?, status?, tags?, due_date?, version?)` — updates a task with the same optimistic concurrency handling as stories.
+- `taiga.epics.list(project_id, include_details?, page?, page_size?)` — lists epics for a project with optional field control and pagination (default: minimal fields, page_size=50).
+- `taiga.epics.get(epic_id)` — **NEW v1.1.0** fetches a specific epic by ID with full details.
+- `taiga.stories.list(project_id, search?, epic_id?, tags?, page?, page_size?)` — lists user stories for a project with optional filters for text search, epic membership, tags, and pagination (default: page_size=50).
+- `taiga.stories.get(user_story_id)` — **NEW v1.1.0** fetches a specific story by ID with full details.
 - `taiga.tasks.list(project_id?, user_story_id?, assigned_to?, search?, status?, page?, page_size?)` — lists tasks with flexible filters and pagination metadata, resolving status names when a `project_id` is supplied.
+- `taiga.tasks.get(task_id)` — **NEW v1.1.0** fetches a specific task by ID with full details.
 - `taiga.users.list(project_id?, search?)` — finds Taiga users by project membership with optional substring matching across full name, username, or email.
 - `taiga.milestones.list(project_id, search?)` — returns milestones/sprints for a project, allowing optional name/slug filtering.
+
+### Create Operations
+- `taiga.stories.create(project_id, subject, description?, status?, tags?, assigned_to?)` — creates a Taiga user story; `status` accepts either an id or status name/slug.
+- `taiga.epics.add_user_story(epic_id, user_story_id)` — links a user story to an epic.
+- `taiga.tasks.create(user_story_id, subject, description?, assigned_to?, status?, tags?, due_date?, idempotency_key?)` — creates a Taiga task under a story, applying status lookups and idempotency safeguards.
+
+### Update Operations
+- `taiga.stories.update(user_story_id, subject?, description?, append_description?, status?, tags?, add_tags?, assigned_to?, epic_id?, milestone_id?, custom_attributes?, version?)` — updates an existing story with optimistic concurrency checks and server-side status resolution. **NEW v1.1.0**: `append_description` and `add_tags` for safe collaborative editing.
+- `taiga.tasks.update(task_id, subject?, description?, append_description?, assigned_to?, status?, tags?, add_tags?, due_date?, version?)` — updates a task with the same optimistic concurrency handling as stories. **NEW v1.1.0**: append-only helpers.
+
+### Delete Operations
+- `taiga.epics.delete(epic_id)` — **NEW v1.1.0** hard delete an epic (DESTRUCTIVE - cannot be undone).
+- `taiga.stories.delete(user_story_id)` — **NEW v1.1.0** hard delete a story (DESTRUCTIVE - cannot be undone).
+- `taiga.tasks.delete(task_id)` — **NEW v1.1.0** hard delete a task (DESTRUCTIVE - cannot be undone).
+- `taiga.stories.archive_or_close(user_story_id, closed_status?, add_archive_tag?)` — **NEW v1.1.0** soft-delete by setting status to closed and adding archive tag (production-safe, reversible).
+- `taiga.tasks.archive_or_close(task_id, closed_status?, add_archive_tag?)` — **NEW v1.1.0** soft-delete for tasks (production-safe, reversible).
 
 ## Action Proxy Surface
 - Purpose: provide a lightweight HTTP bridge for Taiga automation while MCP write tools stay allowlisted.
@@ -48,7 +84,9 @@
   - `GET /actions/get_project?project_id=123` → `{ "project": {...} }` returning the full Taiga project payload for the given id.
   - `GET /actions/get_project_by_slug?slug=acme-backlog` → `{ "project": {...} }` resolving the project via slug.
   - `GET /actions/list_epics?project_id=123&project_id=456` → `{ "epics": [...] }` including the originating `project_id` for each epic.
+  - `GET /actions/get_epic?epic_id=123` → **NEW v1.1.0** `{ "epic": {...} }` fetching a specific epic with full details.
   - `GET /actions/list_stories?project_id=123&epic_id=456&search=prior+art&tag=ip` → `{ "stories": [...] }` filtered by project, epic, keywords, tags, and optional pagination (`page`/`page_size`).
+  - `GET /actions/get_task?task_id=456` → **NEW v1.1.0** `{ "task": {...} }` fetching a specific task with full details.
   - `GET /actions/statuses?project_id=123` → `{ "statuses": [...] }` to drive status pickers.
   - `POST /actions/create_story` → `{ "story": {...} }`; accepts the same payload as the MCP tool and resolves status slugs/names.
   - `POST /actions/update_story` → `{ "story": {...} }`; accepts `story_id` plus any combination of `project_id`, `subject`, `description`, `status`, `tags`, `assigned_to` (status strings resolve to ids automatically).

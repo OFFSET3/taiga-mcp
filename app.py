@@ -273,6 +273,31 @@ async def _list_epics_action(request: Request) -> JSONResponse:
     return JSONResponse({"epics": epics})
 
 
+async def _get_epic_action(request: Request) -> JSONResponse:
+    """Get a specific epic by ID via action proxy."""
+    if (error := _verify_api_key(request)) is not None:
+        return error
+
+    epic_id_param = request.query_params.get("epic_id")
+    if not epic_id_param:
+        return _error_response("epic_id is required", 400)
+
+    try:
+        epic_id = int(epic_id_param)
+    except ValueError:
+        return _error_response("epic_id must be an integer", 400)
+
+    try:
+        epic = await _call_taiga(lambda client: client.get_epic(epic_id))
+    except TaigaAPIError as exc:
+        return _error_response(str(exc), 400)
+    except Exception:  # pragma: no cover - safety net
+        logger.exception("Unexpected error while retrieving epic")
+        return _error_response("Internal server error", 500)
+
+    return JSONResponse({"epic": epic})
+
+
 async def _list_user_stories_action(request: Request) -> JSONResponse:
     if (error := _verify_api_key(request)) is not None:
         return error
@@ -954,6 +979,31 @@ async def _create_task_action(request: Request) -> JSONResponse:
     return JSONResponse({"task": _slice(task, keep)})
 
 
+async def _get_task_action(request: Request) -> JSONResponse:
+    """Get a specific task by ID via action proxy."""
+    if (error := _verify_api_key(request)) is not None:
+        return error
+
+    task_id_param = request.query_params.get("task_id")
+    if not task_id_param:
+        return _error_response("task_id is required", 400)
+
+    try:
+        task_id = int(task_id_param)
+    except ValueError:
+        return _error_response("task_id must be an integer", 400)
+
+    try:
+        task = await _call_taiga(lambda client: client.get_task(task_id))
+    except TaigaAPIError as exc:
+        return _error_response(str(exc), 400)
+    except Exception:  # pragma: no cover - safety net
+        logger.exception("Unexpected error while retrieving task")
+        return _error_response("Internal server error", 500)
+
+    return JSONResponse({"task": task})
+
+
 async def _update_task_action(request: Request) -> JSONResponse:
     if (error := _verify_api_key(request)) is not None:
         return error
@@ -1328,20 +1378,77 @@ async def taiga_projects_get(
     name="taiga.epics.list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
-async def taiga_epics_list(project_id: int) -> list[dict[str, Any]]:
-    """List epics for a Taiga project."""
+async def taiga_epics_list(
+    project_id: int,
+    include_details: bool = False,
+    page: int | None = None,
+    page_size: int | None = None,
+) -> list[dict[str, Any]]:
+    """List epics for a Taiga project with optional pagination and field control.
+    
+    Args:
+        project_id: Taiga project ID
+        include_details: If True, include description and tags (default: False for minimal payload)
+        page: Page number (1-indexed)
+        page_size: Items per page (default/max: 50)
+    """
 
+    # Apply pagination defaults
+    effective_page_size = min(page_size or 50, 50)
+    
     async with get_taiga_client() as client:
         epics = await client.list_epics(project_id)
-    keep = (
-        "id",
-        "ref",
-        "subject",
-        "created_date",
-        "modified_date",
-        "status",
-    )
+    
+    # Minimal fields by default to avoid large payloads
+    if include_details:
+        keep = (
+            "id",
+            "ref",
+            "subject",
+            "description",
+            "tags",
+            "status",
+            "created_date",
+            "modified_date",
+        )
+    else:
+        keep = (
+            "id",
+            "ref",
+            "subject",
+            "created_date",
+            "modified_date",
+            "status",
+        )
+    
+    # Apply pagination
+    if page is not None:
+        start_idx = (page - 1) * effective_page_size
+        end_idx = start_idx + effective_page_size
+        epics = epics[start_idx:end_idx]
+    elif page_size is not None:
+        epics = epics[:effective_page_size]
+    
     return [_slice(epic, keep) for epic in epics]
+
+
+@mcp.tool(
+    name="taiga.epics.get",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_epics_get(epic_id: int) -> dict[str, Any]:
+    """Get a specific epic by ID with full details.
+    
+    Args:
+        epic_id: Numeric epic identifier
+    
+    Returns:
+        Full epic object including description, tags, status, etc.
+    """
+
+    async with get_taiga_client() as client:
+        epic = await client.get_epic(epic_id)
+    return dict(epic)
 
 
 def _make_idempotency_cache_key(raw_key: str, user_story_id: int, subject: str) -> str:
@@ -1386,6 +1493,25 @@ async def _resolve_task_status_id(client, project_id: int, status: int | str | N
 
 
 @mcp.tool(
+    name="taiga.stories.get",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_stories_get(user_story_id: int) -> dict[str, Any]:
+    """Get a specific user story by ID with full details.
+    
+    Args:
+        user_story_id: Numeric story identifier
+    
+    Returns:
+        Full user story object including all fields
+    """
+
+    async with get_taiga_client() as client:
+        story = await client.get_user_story(user_story_id)
+    return dict(story)
+
+
+@mcp.tool(
     name="taiga.stories.list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
@@ -1397,8 +1523,11 @@ async def taiga_stories_list(
     page: int | None = None,
     page_size: int | None = None,
 ) -> list[dict[str, Any]]:
-    """List user stories for a Taiga project with optional filters."""
+    """List user stories for a Taiga project with optional filters (defaults to page_size=50)."""
 
+    # Apply pagination defaults to avoid large payloads
+    effective_page_size = min(page_size or 50, 100) if page_size else 50
+    
     async with get_taiga_client() as client:
         stories = await client.list_user_stories(
             project_id,
@@ -1406,7 +1535,7 @@ async def taiga_stories_list(
             q=search,
             tags=tags,
             page=page,
-            page_size=page_size,
+            page_size=effective_page_size,
         )
     keep = (
         "id",
@@ -1480,15 +1609,22 @@ async def taiga_stories_update(
     user_story_id: int,
     subject: str | None | _UnsetType = UNSET,
     description: str | None | _UnsetType = UNSET,
+    append_description: str | None | _UnsetType = UNSET,
     status: int | str | None | _UnsetType = UNSET,
     tags: list[str] | None | _UnsetType = UNSET,
+    add_tags: list[str] | None | _UnsetType = UNSET,
     assigned_to: int | None | _UnsetType = UNSET,
     epic_id: int | None | _UnsetType = UNSET,
     milestone_id: int | None | _UnsetType = UNSET,
     custom_attributes: dict[str, Any] | None | _UnsetType = UNSET,
     version: int | None | _UnsetType = UNSET,
 ) -> dict[str, Any]:
-    """Update a Taiga user story with partial field semantics."""
+    """Update a Taiga user story with partial field semantics.
+    
+    Supports append-only operations:
+    - append_description: Appends text to existing description (vs overwrite with description)
+    - add_tags: Merges new tags with existing (vs overwrite with tags)
+    """
 
     async with get_taiga_client() as client:
         existing = await client.get_user_story(user_story_id)
@@ -1504,11 +1640,33 @@ async def taiga_stories_update(
         if subject is not UNSET:
             payload["subject"] = subject
             has_updates = True
+        
+        # Handle description - support both overwrite and append
+        if description is not UNSET and append_description is not UNSET:
+            raise ValueError("Cannot set both 'description' and 'append_description'")
+        
         if description is not UNSET:
             payload["description"] = description
             has_updates = True
+        elif append_description is not UNSET and append_description is not None:
+            current_desc = existing.get("description", "")
+            if current_desc:
+                payload["description"] = f"{current_desc}\n\n{append_description}".strip()
+            else:
+                payload["description"] = append_description
+            has_updates = True
+        
+        # Handle tags - support both overwrite and merge
+        if tags is not UNSET and add_tags is not UNSET:
+            raise ValueError("Cannot set both 'tags' and 'add_tags'")
+        
         if tags is not UNSET:
             payload["tags"] = [] if tags is None else tags
+            has_updates = True
+        elif add_tags is not UNSET and add_tags is not None:
+            existing_tags = set(existing.get("tags", []))
+            new_tags = existing_tags | set(add_tags)
+            payload["tags"] = sorted(new_tags)
             has_updates = True
         if assigned_to is not UNSET:
             payload["assigned_to"] = assigned_to
@@ -1557,6 +1715,44 @@ async def taiga_stories_update(
             raise
 
     return dict(updated)
+
+
+@mcp.tool(
+    name="taiga.stories.delete",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
+)
+async def taiga_stories_delete(user_story_id: int) -> dict[str, Any]:
+    """Delete a user story (DESTRUCTIVE - consider archive_or_close for production).
+    
+    Args:
+        user_story_id: Numeric story identifier
+    
+    Returns:
+        Confirmation payload with deleted story ID
+    """
+
+    async with get_taiga_client() as client:
+        await client.delete_user_story(user_story_id)
+    return {"id": user_story_id, "deleted": True}
+
+
+@mcp.tool(
+    name="taiga.epics.delete",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
+)
+async def taiga_epics_delete(epic_id: int) -> dict[str, Any]:
+    """Delete an epic (DESTRUCTIVE - cannot be undone).
+    
+    Args:
+        epic_id: Numeric epic identifier
+    
+    Returns:
+        Confirmation payload with deleted epic ID
+    """
+
+    async with get_taiga_client() as client:
+        await client.delete_epic(epic_id)
+    return {"id": epic_id, "deleted": True}
 
 
 @mcp.tool(
@@ -1640,13 +1836,20 @@ async def taiga_tasks_update(
     task_id: int,
     subject: str | None | _UnsetType = UNSET,
     description: str | None | _UnsetType = UNSET,
+    append_description: str | None | _UnsetType = UNSET,
     assigned_to: int | None | _UnsetType = UNSET,
     status: int | str | None | _UnsetType = UNSET,
     tags: list[str] | None | _UnsetType = UNSET,
+    add_tags: list[str] | None | _UnsetType = UNSET,
     due_date: str | None | _UnsetType = UNSET,
     version: int | None | _UnsetType = UNSET,
 ) -> dict[str, Any]:
-    """Update fields on an existing Taiga task."""
+    """Update fields on an existing Taiga task.
+    
+    Supports append-only operations:
+    - append_description: Appends text to existing description (vs overwrite with description)
+    - add_tags: Merges new tags with existing (vs overwrite with tags)
+    """
 
     async with get_taiga_client() as client:
         existing = await client.get_task(task_id)
@@ -1662,14 +1865,37 @@ async def taiga_tasks_update(
         if subject is not UNSET:
             payload["subject"] = subject
             has_updates = True
+        
+        # Handle description - support both overwrite and append
+        if description is not UNSET and append_description is not UNSET:
+            raise ValueError("Cannot set both 'description' and 'append_description'")
+        
         if description is not UNSET:
             payload["description"] = description
             has_updates = True
+        elif append_description is not UNSET and append_description is not None:
+            current_desc = existing.get("description", "")
+            if current_desc:
+                payload["description"] = f"{current_desc}\n\n{append_description}".strip()
+            else:
+                payload["description"] = append_description
+            has_updates = True
+        
         if assigned_to is not UNSET:
             payload["assigned_to"] = assigned_to
             has_updates = True
+        
+        # Handle tags - support both overwrite and merge
+        if tags is not UNSET and add_tags is not UNSET:
+            raise ValueError("Cannot set both 'tags' and 'add_tags'")
+        
         if tags is not UNSET:
             payload["tags"] = [] if tags is None else tags
+            has_updates = True
+        elif add_tags is not UNSET and add_tags is not None:
+            existing_tags = set(existing.get("tags", []))
+            new_tags = existing_tags | set(add_tags)
+            payload["tags"] = sorted(new_tags)
             has_updates = True
         if due_date is not UNSET:
             payload["due_date"] = _validate_due_date(due_date)
@@ -1707,6 +1933,141 @@ async def taiga_tasks_update(
                 ) from exc
             raise
 
+    return dict(updated)
+
+
+@mcp.tool(
+    name="taiga.tasks.delete",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
+)
+async def taiga_tasks_delete(task_id: int) -> dict[str, Any]:
+    """Delete a task (DESTRUCTIVE - consider archive_or_close for production).
+    
+    Args:
+        task_id: Numeric task identifier
+    
+    Returns:
+        Confirmation payload with deleted task ID
+    """
+
+    async with get_taiga_client() as client:
+        await client.delete_task(task_id)
+    return {"id": task_id, "deleted": True}
+
+
+@mcp.tool(
+    name="taiga.tasks.archive_or_close",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_tasks_archive_or_close(
+    task_id: int,
+    closed_status: int | str | None = None,
+    add_archive_tag: bool = True,
+) -> dict[str, Any]:
+    """Soft-delete a task by marking it as closed (safer than hard delete for production).
+    
+    Args:
+        task_id: Numeric task identifier
+        closed_status: Status ID or name to use for closure (finds closed status if not provided)
+        add_archive_tag: If True, adds 'archived-by-mcp' tag (default: True)
+    
+    Returns:
+        Updated task object with closed status and archive tag
+    """
+
+    async with get_taiga_client() as client:
+        existing = await client.get_task(task_id)
+        project_raw = existing.get("project")
+        try:
+            project_id = int(project_raw)
+        except (TypeError, ValueError):
+            raise TaigaAPIError("Unable to resolve project for task archive") from None
+        
+        # Find a closed status if not provided
+        if closed_status is None:
+            statuses = await client.list_task_statuses(project_id)
+            closed_statuses = [s for s in statuses if s.get("is_closed", False)]
+            if not closed_statuses:
+                raise TaigaAPIError(f"No closed task status found for project {project_id}")
+            status_id = closed_statuses[0]["id"]
+        else:
+            status_id = await _resolve_task_status_id(client, project_id, closed_status)
+        
+        # Build update payload
+        payload: dict[str, Any] = {"status": status_id}
+        
+        # Add archive tag if requested
+        if add_archive_tag:
+            existing_tags = set(existing.get("tags", []))
+            new_tags = existing_tags | {"archived-by-mcp"}
+            payload["tags"] = sorted(new_tags)
+        
+        # Apply version for optimistic concurrency
+        version = existing.get("version")
+        if version is None:
+            raise TaigaAPIError("Unable to resolve version for task archive")
+        payload["version"] = int(version)
+        
+        updated = await client.update_task(task_id, payload)
+    
+    return dict(updated)
+
+
+@mcp.tool(
+    name="taiga.stories.archive_or_close",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_stories_archive_or_close(
+    user_story_id: int,
+    closed_status: int | str | None = None,
+    add_archive_tag: bool = True,
+) -> dict[str, Any]:
+    """Soft-delete a story by marking it as closed (safer than hard delete for production).
+    
+    Args:
+        user_story_id: Numeric story identifier
+        closed_status: Status ID or name to use for closure (finds closed status if not provided)
+        add_archive_tag: If True, adds 'archived-by-mcp' tag (default: True)
+    
+    Returns:
+        Updated story object with closed status and archive tag
+    """
+
+    async with get_taiga_client() as client:
+        existing = await client.get_user_story(user_story_id)
+        project_raw = existing.get("project")
+        try:
+            project_id = int(project_raw)
+        except (TypeError, ValueError):
+            raise TaigaAPIError("Unable to resolve project for story archive") from None
+        
+        # Find a closed status if not provided
+        if closed_status is None:
+            statuses = await client.list_user_story_statuses(project_id)
+            closed_statuses = [s for s in statuses if s.get("is_closed", False)]
+            if not closed_statuses:
+                raise TaigaAPIError(f"No closed story status found for project {project_id}")
+            status_id = closed_statuses[0]["id"]
+        else:
+            status_id = await _resolve_user_story_status_id(client, project_id, closed_status)
+        
+        # Build update payload
+        payload: dict[str, Any] = {"status": status_id}
+        
+        # Add archive tag if requested
+        if add_archive_tag:
+            existing_tags = set(existing.get("tags", []))
+            new_tags = existing_tags | {"archived-by-mcp"}
+            payload["tags"] = sorted(new_tags)
+        
+        # Apply version for optimistic concurrency
+        version = existing.get("version")
+        if version is None:
+            raise TaigaAPIError("Unable to resolve version for story archive")
+        payload["version"] = int(version)
+        
+        updated = await client.update_user_story(user_story_id, payload)
+    
     return dict(updated)
 
 
@@ -1775,6 +2136,25 @@ async def taiga_tasks_list(
     )
     filtered_tasks = [_slice(task, keep) for task in tasks]
     return {"tasks": filtered_tasks, "pagination": pagination}
+
+
+@mcp.tool(
+    name="taiga.tasks.get",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_tasks_get(task_id: int) -> dict[str, Any]:
+    """Get a specific task by ID with full details.
+    
+    Args:
+        task_id: Numeric task identifier
+    
+    Returns:
+        Full task object including all fields
+    """
+
+    async with get_taiga_client() as client:
+        task = await client.get_task(task_id)
+    return dict(task)
 
 
 @mcp.tool(
@@ -1886,8 +2266,10 @@ app = Starlette(
         Route("/actions/get_project", _get_project_action, methods=["GET"]),
         Route("/actions/get_project_by_slug", _get_project_by_slug_action, methods=["GET"]),
         Route("/actions/list_epics", _list_epics_action, methods=["GET"]),
-    Route("/actions/list_stories", _list_user_stories_action, methods=["GET"]),
+        Route("/actions/get_epic", _get_epic_action, methods=["GET"]),
+        Route("/actions/list_stories", _list_user_stories_action, methods=["GET"]),
         Route("/actions/get_story", _get_story_action, methods=["GET"]),
+        Route("/actions/get_task", _get_task_action, methods=["GET"]),
         Route("/actions/statuses", _list_statuses_action, methods=["GET"]),
         Route("/actions/create_story", _create_story_action, methods=["POST"]),
         Route("/actions/add_story_to_epic", _add_story_to_epic_action, methods=["POST"]),
