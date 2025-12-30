@@ -71,6 +71,19 @@ def _expected_api_key() -> str | None:
     return os.getenv("ACTION_PROXY_API_KEY")
 
 
+def _redact_email(value: str | None) -> str | None:
+    if not value:
+        return None
+    if "@" not in value:
+        return "***"
+    local, domain = value.split("@", 1)
+    if len(local) <= 2:
+        masked_local = "*" * len(local)
+    else:
+        masked_local = local[:2] + "***"
+    return f"{masked_local}@{domain}"
+
+
 def _verify_api_key(request: Request) -> JSONResponse | None:
     expected = _expected_api_key()
     if not expected:
@@ -271,6 +284,57 @@ async def _list_epics_action(request: Request) -> JSONResponse:
         return _error_response("Internal server error", 500)
 
     return JSONResponse({"epics": epics})
+
+
+async def _diagnostics_action(request: Request) -> JSONResponse:
+    """Return non-sensitive runtime diagnostics for debugging deployments."""
+
+    if (error := _verify_api_key(request)) is not None:
+        return error
+
+    slug = request.query_params.get("slug")
+    base_url = os.getenv("TAIGA_BASE_URL")
+    username = _redact_email(os.getenv("TAIGA_USERNAME"))
+
+    try:
+        async with get_taiga_client() as client:
+            user_id = await client.get_current_user_id()
+            projects = await client.list_projects(params={"member": str(user_id)})
+    except TaigaAPIError as exc:
+        return JSONResponse(
+            {
+                "diagnostics": {
+                    "taiga_base_url": base_url,
+                    "taiga_username": username,
+                    "error": str(exc),
+                }
+            }
+        )
+    except Exception:  # pragma: no cover - safety net
+        logger.exception("Unexpected error while gathering diagnostics")
+        return _error_response("Internal server error", 500)
+
+    slugs = [p.get("slug") for p in projects if isinstance(p, dict) and p.get("slug")]
+    slugs = slugs[:10]
+    matched = None
+    if slug:
+        for project in projects:
+            if isinstance(project, dict) and project.get("slug") == slug:
+                matched = _slice(project, ("id", "name", "slug", "is_private"))
+                break
+
+    return JSONResponse(
+        {
+            "diagnostics": {
+                "taiga_base_url": base_url,
+                "taiga_username": username,
+                "user_id": user_id,
+                "projects_count": len(projects),
+                "project_slugs_sample": slugs,
+                "matched_project": matched,
+            }
+        }
+    )
 
 
 async def _get_epic_action(request: Request) -> JSONResponse:
@@ -1375,6 +1439,43 @@ async def taiga_projects_get(
 
 
 @mcp.tool(
+    name="taiga.diagnostics",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_diagnostics(project_slug: str | None = None) -> dict[str, Any]:
+    """Return non-sensitive runtime diagnostics.
+
+    Use this to debug why a *deployed* taiga-mcp instance (e.g., used by ChatGPT)
+    behaves differently than local scripts.
+    """
+
+    base_url = os.getenv("TAIGA_BASE_URL")
+    username = _redact_email(os.getenv("TAIGA_USERNAME"))
+
+    async with get_taiga_client() as client:
+        user_id = await client.get_current_user_id()
+        projects = await client.list_projects(params={"member": str(user_id)})
+
+    slugs = [p.get("slug") for p in projects if isinstance(p, dict) and p.get("slug")]
+    slugs = slugs[:10]
+    matched = None
+    if project_slug:
+        for project in projects:
+            if isinstance(project, dict) and project.get("slug") == project_slug:
+                matched = _slice(project, ("id", "name", "slug", "is_private"))
+                break
+
+    return {
+        "taiga_base_url": base_url,
+        "taiga_username": username,
+        "user_id": user_id,
+        "projects_count": len(projects),
+        "project_slugs_sample": slugs,
+        "matched_project": matched,
+    }
+
+
+@mcp.tool(
     name="taiga.epics.list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
@@ -2249,6 +2350,122 @@ async def healthz(_):
 async def root(_):
     return PlainTextResponse("Taiga MCP up", status_code=200)
 
+
+async def openapi_schema(_):
+    """Serve a minimal OpenAPI document for the /actions/* proxy.
+
+    This is intended for ChatGPT Custom GPT Actions (API-key auth via X-Api-Key).
+    """
+
+    schema: dict[str, Any] = {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Taiga MCP Action Proxy",
+            "version": "1.0.0",
+            "description": "API-key protected REST facade over Taiga MCP (/actions/*).",
+        },
+        "servers": [{"url": "https://REPLACE_WITH_YOUR_TAIGA_MCP_HOST"}],
+        "components": {
+            "securitySchemes": {
+                "ApiKeyAuth": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-Api-Key",
+                }
+            }
+        },
+        "security": [{"ApiKeyAuth": []}],
+        "paths": {
+            "/actions/list_projects": {
+                "get": {
+                    "operationId": "listProjects",
+                    "parameters": [
+                        {"name": "search", "in": "query", "required": False, "schema": {"type": "string"}},
+                    ],
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/actions/get_project_by_slug": {
+                "get": {
+                    "operationId": "getProjectBySlug",
+                    "parameters": [
+                        {"name": "slug", "in": "query", "required": True, "schema": {"type": "string"}},
+                    ],
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/actions/list_epics": {
+                "get": {
+                    "operationId": "listEpics",
+                    "parameters": [
+                        {
+                            "name": "project_id",
+                            "in": "query",
+                            "required": True,
+                            "schema": {"type": "integer"},
+                            "description": "Taiga project id (repeatable).",
+                        }
+                    ],
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/actions/list_stories": {
+                "get": {
+                    "operationId": "listStories",
+                    "parameters": [
+                        {"name": "project_id", "in": "query", "required": False, "schema": {"type": "integer"}},
+                        {"name": "epic", "in": "query", "required": False, "schema": {"type": "integer"}},
+                        {"name": "q", "in": "query", "required": False, "schema": {"type": "string"}},
+                        {"name": "page", "in": "query", "required": False, "schema": {"type": "integer"}},
+                        {"name": "page_size", "in": "query", "required": False, "schema": {"type": "integer"}},
+                    ],
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/actions/get_story": {
+                "get": {
+                    "operationId": "getStory",
+                    "parameters": [
+                        {"name": "story_id", "in": "query", "required": True, "schema": {"type": "integer"}},
+                    ],
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/actions/create_story": {
+                "post": {
+                    "operationId": "createStory",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object", "additionalProperties": True}}},
+                    },
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/actions/update_story": {
+                "post": {
+                    "operationId": "updateStory",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object", "additionalProperties": True}}},
+                    },
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/actions/delete_story": {
+                "post": {
+                    "operationId": "deleteStory",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object", "additionalProperties": True}}},
+                    },
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+        },
+    }
+
+    return JSONResponse(schema)
+
 @asynccontextmanager
 async def lifespan(_app):
     # The streamable HTTP transport requires its session manager task group to be running.
@@ -2262,6 +2479,8 @@ app = Starlette(
     routes=[
         Route("/", root),
         Route("/healthz", healthz),
+        Route("/openapi.json", openapi_schema, methods=["GET"]),
+        Route("/actions/diagnostics", _diagnostics_action, methods=["GET"]),
         Route("/actions/list_projects", _list_projects_action, methods=["GET"]),
         Route("/actions/get_project", _get_project_action, methods=["GET"]),
         Route("/actions/get_project_by_slug", _get_project_by_slug_action, methods=["GET"]),

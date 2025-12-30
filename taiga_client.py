@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Mapping, Sequence
 
@@ -64,8 +65,7 @@ class TaigaClient:
 
     def __init__(self) -> None:
         base_url = _require_env("TAIGA_BASE_URL")
-        # Normalise base URL to avoid eventual double slashes.
-        base_url = base_url.rstrip("/")
+        base_url = self._normalize_base_url(base_url)
 
         self._username = _require_env("TAIGA_USERNAME")
         self._password = _require_env("TAIGA_PASSWORD")
@@ -77,6 +77,26 @@ class TaigaClient:
         )
         self._auth_token: str | None = None
         self._user_id: int | None = None
+
+    @staticmethod
+    def _normalize_base_url(base_url: str) -> str:
+        """Normalize TAIGA_BASE_URL.
+
+        Operators commonly set TAIGA_BASE_URL as either:
+        - https://taiga.example.com            (site root)
+        - https://taiga.example.com/api/v1    (API root)
+
+        This client expects an API root; if it's missing, append /api/v1.
+        """
+
+        cleaned = base_url.strip().rstrip("/")
+        # If /api/vN is already present, keep it.
+        if re.search(r"/api/v\d+$", cleaned, flags=re.IGNORECASE):
+            return cleaned
+        # If URL already contains /api/vN somewhere (e.g. with query), don't try to outsmart it.
+        if re.search(r"/api/v\d+", cleaned, flags=re.IGNORECASE):
+            return cleaned
+        return cleaned + "/api/v1"
 
     async def close(self) -> None:
         await self._client.aclose()
