@@ -76,6 +76,24 @@ class _NormalizeMountedRootPath:
         await self._app(scope, receive, send)
 
 
+class _RewriteMountedPaths:
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path")
+            if path == "/mcp":
+                scope = dict(scope)
+                scope["path"] = "/mcp/"
+                scope["raw_path"] = b"/mcp/"
+            elif path == "/sse":
+                scope = dict(scope)
+                scope["path"] = "/sse/"
+                scope["raw_path"] = b"/sse/"
+        await self._app(scope, receive, send)
+
+
 mcp = FastMCP(
     "Taiga MCP",
     host=os.getenv("MCP_HOST", "0.0.0.0"),
@@ -2548,7 +2566,7 @@ async def lifespan(_app):
         yield
 
 
-app = Starlette(
+starlette_app = Starlette(
     routes=[
         Route("/", root),
         Route("/healthz", healthz),
@@ -2581,7 +2599,11 @@ app = Starlette(
     ],
     lifespan=lifespan,
 )
-app.router.redirect_slashes = False
+starlette_app.router.redirect_slashes = False
+
+# Starlette's function middleware uses BaseHTTPMiddleware which is unsafe for
+# streaming responses (e.g., SSE). Use a pure-ASGI wrapper for path rewrites.
+app = _RewriteMountedPaths(starlette_app)
 
 
 if __name__ == "__main__":
