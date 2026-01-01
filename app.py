@@ -64,6 +64,18 @@ def _get_transport_security_settings() -> TransportSecuritySettings | None:
     )
 
 
+class _NormalizeMountedRootPath:
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") in ("", None):
+            scope = dict(scope)
+            scope["path"] = "/"
+            scope["raw_path"] = b"/"
+        await self._app(scope, receive, send)
+
+
 mcp = FastMCP(
     "Taiga MCP",
     host=os.getenv("MCP_HOST", "0.0.0.0"),
@@ -72,28 +84,14 @@ mcp = FastMCP(
     transport_security=_get_transport_security_settings(),
 )
 # Prebuild sub-apps so we can wire their lifespans into the parent Starlette app.
-sse_subapp = mcp.sse_app()
+# NOTE: Do not use Starlette's function middleware (`@app.middleware("http")`) here.
+# That path uses BaseHTTPMiddleware, which breaks streaming responses (SSE).
+sse_starlette_app = mcp.sse_app()
+sse_subapp = _NormalizeMountedRootPath(sse_starlette_app)
 
-
-@sse_subapp.middleware("http")
-async def _normalize_sse_path(request, call_next):
-    # Mounted sub-apps may receive an empty path for their root routes.
-    if request.scope.get("path") in ("", None):
-        request.scope["path"] = "/"
-        request.scope["raw_path"] = b"/"
-    return await call_next(request)
-streamable_http_subapp = mcp.streamable_http_app()
-streamable_http_subapp.router.redirect_slashes = False
-
-
-@streamable_http_subapp.middleware("http")
-async def _normalize_blank_path(request, call_next):
-    # Starlette mounts strip the trailing slash, leaving an empty path for "/mcp".
-    # Ensure the downstream Streamable HTTP route sees the root path.
-    if request.scope.get("path") == "":
-        request.scope["path"] = "/"
-        request.scope["raw_path"] = b"/"
-    return await call_next(request)
+streamable_http_starlette_app = mcp.streamable_http_app()
+streamable_http_starlette_app.router.redirect_slashes = False
+streamable_http_subapp = _NormalizeMountedRootPath(streamable_http_starlette_app)
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
@@ -2550,8 +2548,6 @@ async def lifespan(_app):
         yield
 
 
-# Mount the MCP streamable app under both /mcp and /mcp/ so proxies that normalize
-# paths differently will still carry the session headers through without a redirect.
 app = Starlette(
     routes=[
         Route("/", root),
@@ -2586,22 +2582,6 @@ app = Starlette(
     lifespan=lifespan,
 )
 app.router.redirect_slashes = False
-
-
-@app.middleware("http")
-async def _rewrite_mcp_path(request, call_next):
-    if request.scope.get("path") == "/mcp":
-        request.scope["path"] = "/mcp/"
-        request.scope["raw_path"] = b"/mcp/"
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def _rewrite_sse_path(request, call_next):
-    if request.scope.get("path") == "/sse":
-        request.scope["path"] = "/sse/"
-        request.scope["raw_path"] = b"/sse/"
-    return await call_next(request)
 
 
 if __name__ == "__main__":
