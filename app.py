@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Mount, Route
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from taiga_client import TaigaAPIError, get_taiga_client
@@ -27,7 +28,49 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("Taiga MCP", sse_path="/", streamable_http_path="/")
+
+def _truthy_env(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _get_transport_security_settings() -> TransportSecuritySettings | None:
+    # FastMCP enables DNS-rebinding protection automatically when host is localhost.
+    # In container environments (Azure Container Apps ingress), the Host header will
+    # be the public FQDN, so that default would reject all requests with HTTP 421.
+    #
+    # Default behavior here is to keep protection disabled unless explicitly enabled
+    # via env vars.
+    if not _truthy_env(os.getenv("MCP_ENABLE_DNS_REBINDING_PROTECTION")):
+        return None
+
+    raw_hosts = os.getenv("MCP_ALLOWED_HOSTS", "").strip()
+    if not raw_hosts:
+        logger.warning(
+            "MCP_ENABLE_DNS_REBINDING_PROTECTION is true but MCP_ALLOWED_HOSTS is empty; "
+            "disabling DNS rebinding protection to avoid rejecting all requests"
+        )
+        return None
+
+    allowed_hosts = [host.strip() for host in raw_hosts.split(",") if host.strip()]
+    raw_origins = os.getenv("MCP_ALLOWED_ORIGINS", "").strip()
+    allowed_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
+mcp = FastMCP(
+    "Taiga MCP",
+    host=os.getenv("MCP_HOST", "0.0.0.0"),
+    sse_path="/",
+    streamable_http_path="/",
+    transport_security=_get_transport_security_settings(),
+)
 # Prebuild sub-apps so we can wire their lifespans into the parent Starlette app.
 sse_subapp = mcp.sse_app()
 
@@ -259,8 +302,35 @@ async def _list_epics_action(request: Request) -> JSONResponse:
         return error
 
     project_ids = request.query_params.getlist("project_id")
+    slug = request.query_params.get("slug")
+
     if not project_ids:
-        return _error_response("At least one project_id is required", 400)
+        env_project_id = os.getenv("TAIGA_PROJECT_ID")
+        if env_project_id:
+            try:
+                project_ids = [str(int(env_project_id))]
+            except ValueError:
+                return _error_response("TAIGA_PROJECT_ID must be an integer", 500)
+        else:
+            slug_to_use = slug or os.getenv("TAIGA_PROJECT_SLUG")
+            if not slug_to_use:
+                return _error_response(
+                    "project_id is required (or configure TAIGA_PROJECT_ID / TAIGA_PROJECT_SLUG)",
+                    400,
+                )
+
+            try:
+                project = await _call_taiga(lambda client: client.get_project_by_slug(slug_to_use))
+            except TaigaAPIError as exc:
+                return _error_response(str(exc), 400)
+            except Exception:  # pragma: no cover - safety net
+                logger.exception("Unexpected error while resolving project slug")
+                return _error_response("Internal server error", 500)
+
+            project_id = project.get("id")
+            if not isinstance(project_id, int):
+                return _error_response("Unable to resolve project_id from slug", 500)
+            project_ids = [str(project_id)]
 
     try:
         parsed_ids = [int(value) for value in project_ids]
@@ -2401,10 +2471,17 @@ async def openapi_schema(_):
                         {
                             "name": "project_id",
                             "in": "query",
-                            "required": True,
+                            "required": False,
                             "schema": {"type": "integer"},
-                            "description": "Taiga project id (repeatable).",
-                        }
+                            "description": "Taiga project id (repeatable). If omitted, defaults to TAIGA_PROJECT_ID / TAIGA_PROJECT_SLUG.",
+                        },
+                        {
+                            "name": "slug",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "string"},
+                            "description": "Project slug to resolve a project_id when project_id is omitted.",
+                        },
                     ],
                     "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
                 }
