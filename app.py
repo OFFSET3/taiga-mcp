@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import time
+import warnings
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from json import JSONDecodeError
@@ -23,16 +24,111 @@ from mcp.types import ToolAnnotations
 from taiga_client import TaigaAPIError, get_taiga_client
 from pydantic import BaseModel, ConfigDict
 
+try:  # Keep logs clean in production; UNSET defaults are intentionally not serializable.
+    from pydantic.json_schema import PydanticJsonSchemaWarning
+
+    warnings.filterwarnings(
+        "ignore",
+        category=PydanticJsonSchemaWarning,
+        message=r"Default value UNSET is not JSON serializable; excluding default from JSON schema",
+    )
+except Exception:  # pragma: no cover
+    pass
+
 # Load environment variables from .env file
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 
+def _taiga_profile() -> str:
+    """Return the current runtime profile.
+
+    Profiles let us run the same codebase for different client cohorts:
+    - chatgpt: Human-in-the-loop, safest defaults (no deletes)
+    - ide: Developer + agent UX, typically safe-by-default
+    - builder: Autonomous agent with rollback checkpoints (may enable deletes)
+    """
+
+    raw = os.getenv("TAIGA_PROFILE", "chatgpt").strip().lower()
+    return raw or "chatgpt"
+
+
+def _destructive_mode() -> str:
+    """Return destructive mode string.
+
+    Allowed values (case-insensitive):
+    - off: do not expose destructive operations
+    - on: expose destructive operations
+    - inherit: use profile-based defaults
+    """
+
+    raw = os.getenv("TAIGA_DESTRUCTIVE_MODE", "inherit").strip().lower()
+    return raw or "inherit"
+
+
+def _destructive_enabled() -> bool:
+    mode = _destructive_mode()
+    if mode in {"0", "false", "off", "disabled"}:
+        return False
+    if mode in {"1", "true", "on", "enabled"}:
+        return True
+    # inherit
+    return _taiga_profile() == "builder"
+
+
+DESTRUCTIVE_ENABLED = _destructive_enabled()
+
+
 def _truthy_env(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _default_project_id_env() -> int | None:
+    raw = os.getenv("TAIGA_PROJECT_ID")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise TaigaAPIError("TAIGA_PROJECT_ID must be an integer") from None
+
+
+def _default_project_slug_env() -> str | None:
+    raw = os.getenv("TAIGA_PROJECT_SLUG")
+    return raw.strip() if raw and raw.strip() else None
+
+
+async def _resolve_default_project_id(client) -> int | None:
+    project_id = _default_project_id_env()
+    if project_id is not None:
+        return project_id
+
+    slug = _default_project_slug_env()
+    if slug:
+        project = await client.get_project_by_slug(slug)
+        value = project.get("id")
+        if value is None:
+            raise TaigaAPIError(f"Unable to resolve project id for slug '{slug}'")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise TaigaAPIError(f"Unable to resolve project id for slug '{slug}'") from None
+
+    return None
+
+
+async def _require_project_id(client, provided: int | None) -> int:
+    if provided is not None:
+        return int(provided)
+    resolved = await _resolve_default_project_id(client)
+    if resolved is None:
+        raise ValueError(
+            "project_id is required (or set TAIGA_PROJECT_ID / TAIGA_PROJECT_SLUG in the environment)"
+        )
+    return resolved
 
 
 def _get_transport_security_settings() -> TransportSecuritySettings | None:
@@ -101,6 +197,31 @@ mcp = FastMCP(
     streamable_http_path="/",
     transport_security=_get_transport_security_settings(),
 )
+
+
+@mcp.tool(
+    name="taiga_capabilities",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_capabilities() -> dict[str, Any]:
+    """Return server capabilities and policy configuration (non-sensitive).
+
+    Intended for ChatGPT / IDE agents / Builder Agent to adapt behavior.
+    """
+
+    return {
+        "profile": _taiga_profile(),
+        "destructive_enabled": DESTRUCTIVE_ENABLED,
+        "default_project": {
+            "taiga_project_id_env": os.getenv("TAIGA_PROJECT_ID"),
+            "taiga_project_slug_env": os.getenv("TAIGA_PROJECT_SLUG"),
+        },
+        "transports": {
+            "mcp_streamable_http_path": "/mcp",
+            "mcp_sse_path": "/sse",
+            "actions_base_path": "/actions",
+        },
+    }
 # Prebuild sub-apps so we can wire their lifespans into the parent Starlette app.
 # NOTE: Do not use Starlette's function middleware (`@app.middleware("http")`) here.
 # That path uses BaseHTTPMiddleware, which breaks streaming responses (SSE).
@@ -124,6 +245,13 @@ def _slice(record: dict[str, Any], keys: Sequence[str]) -> dict[str, Any]:
 
 def _error_response(message: str, status_code: int) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status_code)
+
+
+def _destructive_disabled_response() -> JSONResponse:
+    return _error_response(
+        "Destructive operations are disabled in this deployment. Use archive_or_close or enable TAIGA_DESTRUCTIVE_MODE.",
+        403,
+    )
 
 
 def _expected_api_key() -> str | None:
@@ -756,6 +884,31 @@ async def _update_story_action(request: Request) -> JSONResponse:
             except ValueError as exc:
                 return _error_response(str(exc), 400)
 
+    if "points" in data:
+        points = data["points"]
+        if points is None:
+            payload["points"] = None
+        elif not isinstance(points, dict):
+            return _error_response("points must be an object mapping role_id to point_id", 400)
+        else:
+            normalized: dict[str, str | None] = {}
+            for raw_role_id, raw_point_id in points.items():
+                try:
+                    role_id = str(_parse_int(raw_role_id, "points role_id"))
+                except ValueError as exc:
+                    return _error_response(str(exc), 400)
+
+                if raw_point_id is None:
+                    normalized[role_id] = None
+                    continue
+                try:
+                    point_id = str(_parse_int(raw_point_id, "points point_id"))
+                except ValueError as exc:
+                    return _error_response(str(exc), 400)
+                normalized[role_id] = point_id
+
+            payload["points"] = normalized
+
     status_present = "status" in data
     status_value = data.get("status") if status_present else None
     if status_present and status_value is None:
@@ -788,6 +941,8 @@ async def _update_story_action(request: Request) -> JSONResponse:
         "description",
         "assigned_to",
         "tags",
+        "points",
+        "total_points",
         "created_date",
         "modified_date",
     )
@@ -838,6 +993,9 @@ async def _update_story_with_client(
 async def _delete_story_action(request: Request) -> JSONResponse:
     if (error := _verify_api_key(request)) is not None:
         return error
+
+    if not DESTRUCTIVE_ENABLED:
+        return _destructive_disabled_response()
 
     data, parse_error = await _get_json_body(request)
     if parse_error:
@@ -1030,6 +1188,9 @@ async def _update_epic_with_client(
 async def _delete_epic_action(request: Request) -> JSONResponse:
     if (error := _verify_api_key(request)) is not None:
         return error
+
+    if not DESTRUCTIVE_ENABLED:
+        return _destructive_disabled_response()
 
     data, parse_error = await _get_json_body(request)
     if parse_error:
@@ -1254,6 +1415,9 @@ async def _delete_task_action(request: Request) -> JSONResponse:
     if (error := _verify_api_key(request)) is not None:
         return error
 
+    if not DESTRUCTIVE_ENABLED:
+        return _destructive_disabled_response()
+
     data, parse_error = await _get_json_body(request)
     if parse_error:
         return parse_error
@@ -1456,6 +1620,9 @@ async def _delete_issue_action(request: Request) -> JSONResponse:
     if (error := _verify_api_key(request)) is not None:
         return error
 
+    if not DESTRUCTIVE_ENABLED:
+        return _destructive_disabled_response()
+
     data, parse_error = await _get_json_body(request)
     if parse_error:
         return parse_error
@@ -1481,7 +1648,7 @@ async def _delete_issue_action(request: Request) -> JSONResponse:
 
 
 @mcp.tool(
-    name="taiga.projects.list",
+    name="taiga_projects_list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_projects_list(search: str | None = None) -> list[dict[str, Any]]:
@@ -1503,7 +1670,7 @@ async def taiga_projects_list(search: str | None = None) -> list[dict[str, Any]]
 
 
 @mcp.tool(
-    name="taiga.projects.get",
+    name="taiga_projects_get",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_projects_get(
@@ -1525,7 +1692,7 @@ async def taiga_projects_get(
 
 
 @mcp.tool(
-    name="taiga.diagnostics",
+    name="taiga_diagnostics",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_diagnostics(project_slug: str | None = None) -> dict[str, Any]:
@@ -1537,10 +1704,16 @@ async def taiga_diagnostics(project_slug: str | None = None) -> dict[str, Any]:
 
     base_url = os.getenv("TAIGA_BASE_URL")
     username = _redact_email(os.getenv("TAIGA_USERNAME"))
+    default_project_id_env = os.getenv("TAIGA_PROJECT_ID")
+    default_project_slug_env = os.getenv("TAIGA_PROJECT_SLUG")
+
+    if project_slug is None:
+        project_slug = _default_project_slug_env()
 
     async with get_taiga_client() as client:
         user_id = await client.get_current_user_id()
         projects = await client.list_projects(params={"member": str(user_id)})
+        resolved_default_project_id = await _resolve_default_project_id(client)
 
     slugs = [p.get("slug") for p in projects if isinstance(p, dict) and p.get("slug")]
     slugs = slugs[:10]
@@ -1551,22 +1724,44 @@ async def taiga_diagnostics(project_slug: str | None = None) -> dict[str, Any]:
                 matched = _slice(project, ("id", "name", "slug", "is_private"))
                 break
 
+    # Report MCP transport security config (non-sensitive)
+    dns_protection_enabled = _truthy_env(os.getenv("MCP_ENABLE_DNS_REBINDING_PROTECTION"))
+    allowed_hosts_raw = os.getenv("MCP_ALLOWED_HOSTS", "")
+    allowed_origins_raw = os.getenv("MCP_ALLOWED_ORIGINS", "")
+    mcp_host = os.getenv("MCP_HOST")
+
     return {
+        "profile": _taiga_profile(),
+        "destructive": {
+            "mode": _destructive_mode(),
+            "enabled": DESTRUCTIVE_ENABLED,
+        },
         "taiga_base_url": base_url,
         "taiga_username": username,
         "user_id": user_id,
         "projects_count": len(projects),
         "project_slugs_sample": slugs,
         "matched_project": matched,
+        "default_project": {
+            "taiga_project_id_env": default_project_id_env,
+            "taiga_project_slug_env": default_project_slug_env,
+            "resolved_project_id": resolved_default_project_id,
+        },
+        "mcp_transport_security": {
+            "dns_rebinding_protection_enabled": dns_protection_enabled,
+            "allowed_hosts_configured": bool(allowed_hosts_raw.strip()),
+            "allowed_origins_configured": bool(allowed_origins_raw.strip()),
+            "mcp_host": mcp_host,
+        },
     }
 
 
 @mcp.tool(
-    name="taiga.epics.list",
+    name="taiga_epics_list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_epics_list(
-    project_id: int,
+    project_id: int | None = None,
     include_details: bool = False,
     page: int | None = None,
     page_size: int | None = None,
@@ -1584,7 +1779,8 @@ async def taiga_epics_list(
     effective_page_size = min(page_size or 50, 50)
     
     async with get_taiga_client() as client:
-        epics = await client.list_epics(project_id)
+        resolved_project_id = await _require_project_id(client, project_id)
+        epics = await client.list_epics(resolved_project_id)
     
     # Minimal fields by default to avoid large payloads
     if include_details:
@@ -1620,7 +1816,7 @@ async def taiga_epics_list(
 
 
 @mcp.tool(
-    name="taiga.epics.get",
+    name="taiga_epics_get",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_epics_get(epic_id: int) -> dict[str, Any]:
@@ -1636,6 +1832,325 @@ async def taiga_epics_get(epic_id: int) -> dict[str, Any]:
     async with get_taiga_client() as client:
         epic = await client.get_epic(epic_id)
     return dict(epic)
+
+
+@mcp.tool(
+    name="taiga_epics_create",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_epics_create(
+    project_id: int | None = None,
+    subject: str | None = None,
+    description: str | None = None,
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create an epic in Taiga.
+
+    If project_id is omitted, resolves from TAIGA_PROJECT_ID / TAIGA_PROJECT_SLUG.
+    """
+
+    if not subject:
+        raise ValueError("subject is required")
+
+    async with get_taiga_client() as client:
+        resolved_project_id = await _require_project_id(client, project_id)
+        payload: dict[str, Any] = {
+            "project": resolved_project_id,
+            "subject": subject,
+        }
+        if description is not None:
+            payload["description"] = description
+        if tags is not None:
+            payload["tags"] = tags
+
+        epic = await client.create_epic(payload)
+
+    keep = (
+        "id",
+        "ref",
+        "subject",
+        "project",
+        "description",
+        "tags",
+        "status",
+        "created_date",
+        "modified_date",
+    )
+    return _slice(epic, keep)
+
+
+@mcp.tool(
+    name="taiga_epics_update",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_epics_update(
+    epic_id: int,
+    subject: str | None | _UnsetType = UNSET,
+    description: str | None | _UnsetType = UNSET,
+    append_description: str | None | _UnsetType = UNSET,
+    tags: list[str] | None | _UnsetType = UNSET,
+    add_tags: list[str] | None | _UnsetType = UNSET,
+    version: int | None | _UnsetType = UNSET,
+) -> dict[str, Any]:
+    """Update a Taiga epic with partial field semantics.
+
+    Supports append-only operations:
+    - append_description: Appends text to existing description (vs overwrite with description)
+    - add_tags: Merges new tags with existing (vs overwrite with tags)
+    """
+
+    async with get_taiga_client() as client:
+        existing = await client.get_epic(epic_id)
+
+        payload: dict[str, Any] = {}
+        has_updates = False
+
+        if subject is not UNSET:
+            payload["subject"] = subject
+            has_updates = True
+
+        if description is not UNSET and append_description is not UNSET:
+            raise ValueError("Cannot set both 'description' and 'append_description'")
+
+        if description is not UNSET:
+            payload["description"] = description
+            has_updates = True
+        elif append_description is not UNSET and append_description is not None:
+            current_desc = existing.get("description", "")
+            if current_desc:
+                payload["description"] = f"{current_desc}\n\n{append_description}".strip()
+            else:
+                payload["description"] = append_description
+            has_updates = True
+
+        if tags is not UNSET and add_tags is not UNSET:
+            raise ValueError("Cannot set both 'tags' and 'add_tags'")
+
+        if tags is not UNSET:
+            payload["tags"] = [] if tags is None else tags
+            has_updates = True
+        elif add_tags is not UNSET and add_tags is not None:
+            existing_tags = set(existing.get("tags", []))
+            new_tags = existing_tags | set(add_tags)
+            payload["tags"] = sorted(new_tags)
+            has_updates = True
+
+        if not has_updates:
+            raise ValueError("At least one field must be provided to update the epic")
+
+        if version is UNSET or version is None:
+            version_value = existing.get("version")
+            if version_value is None:
+                raise TaigaAPIError("Unable to resolve version for epic update")
+            try:
+                payload["version"] = int(version_value)
+            except (TypeError, ValueError):
+                raise TaigaAPIError("Unable to resolve version for epic update") from None
+        else:
+            payload["version"] = int(version)
+
+        try:
+            updated = await client.update_epic(epic_id, payload)
+        except TaigaAPIError as exc:
+            if exc.status_code == 409:
+                latest = await client.get_epic(epic_id)
+                latest_version = latest.get("version")
+                raise ValueError(f"Conflict updating epic {epic_id}: latest version is {latest_version}") from exc
+            raise
+
+    return dict(updated)
+
+
+@mcp.tool(
+    name="taiga_issues_get",
+    annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
+)
+async def taiga_issues_get(issue_id: int) -> dict[str, Any]:
+    """Get a specific issue by ID with full details."""
+
+    async with get_taiga_client() as client:
+        issue = await client.get_issue(issue_id)
+    return dict(issue)
+
+
+@mcp.tool(
+    name="taiga_issues_create",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_issues_create(
+    project_id: int | None = None,
+    subject: str | None = None,
+    description: str | None = None,
+    status: int | None = None,
+    priority: int | None = None,
+    severity: int | None = None,
+    issue_type: int | None = None,
+    assigned_to: int | None = None,
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create an issue in Taiga.
+
+    Note: status/priority/severity/type are numeric Taiga ids.
+    If project_id is omitted, resolves from TAIGA_PROJECT_ID / TAIGA_PROJECT_SLUG.
+    """
+
+    if not subject:
+        raise ValueError("subject is required")
+
+    async with get_taiga_client() as client:
+        resolved_project_id = await _require_project_id(client, project_id)
+        payload: dict[str, Any] = {
+            "project": resolved_project_id,
+            "subject": subject,
+        }
+        if description is not None:
+            payload["description"] = description
+        if status is not None:
+            payload["status"] = status
+        if priority is not None:
+            payload["priority"] = priority
+        if severity is not None:
+            payload["severity"] = severity
+        if issue_type is not None:
+            payload["issue_type"] = issue_type
+        if assigned_to is not None:
+            payload["assigned_to"] = assigned_to
+        if tags is not None:
+            payload["tags"] = tags
+
+        issue = await client.create_issue(payload)
+
+    keep = (
+        "id",
+        "ref",
+        "subject",
+        "project",
+        "status",
+        "priority",
+        "severity",
+        "issue_type",
+        "description",
+        "assigned_to",
+        "tags",
+        "created_date",
+        "modified_date",
+    )
+    return _slice(issue, keep)
+
+
+@mcp.tool(
+    name="taiga_issues_update",
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
+)
+async def taiga_issues_update(
+    issue_id: int,
+    subject: str | None | _UnsetType = UNSET,
+    description: str | None | _UnsetType = UNSET,
+    append_description: str | None | _UnsetType = UNSET,
+    status: int | None | _UnsetType = UNSET,
+    priority: int | None | _UnsetType = UNSET,
+    severity: int | None | _UnsetType = UNSET,
+    issue_type: int | None | _UnsetType = UNSET,
+    assigned_to: int | None | _UnsetType = UNSET,
+    tags: list[str] | None | _UnsetType = UNSET,
+    add_tags: list[str] | None | _UnsetType = UNSET,
+    version: int | None | _UnsetType = UNSET,
+) -> dict[str, Any]:
+    """Update a Taiga issue with partial field semantics.
+
+    Supports append-only operations:
+    - append_description: Appends text to existing description (vs overwrite with description)
+    - add_tags: Merges new tags with existing (vs overwrite with tags)
+    """
+
+    async with get_taiga_client() as client:
+        existing = await client.get_issue(issue_id)
+
+        payload: dict[str, Any] = {}
+        has_updates = False
+
+        if subject is not UNSET:
+            payload["subject"] = subject
+            has_updates = True
+
+        if description is not UNSET and append_description is not UNSET:
+            raise ValueError("Cannot set both 'description' and 'append_description'")
+
+        if description is not UNSET:
+            payload["description"] = description
+            has_updates = True
+        elif append_description is not UNSET and append_description is not None:
+            current_desc = existing.get("description", "")
+            if current_desc:
+                payload["description"] = f"{current_desc}\n\n{append_description}".strip()
+            else:
+                payload["description"] = append_description
+            has_updates = True
+
+        if tags is not UNSET and add_tags is not UNSET:
+            raise ValueError("Cannot set both 'tags' and 'add_tags'")
+
+        if tags is not UNSET:
+            payload["tags"] = [] if tags is None else tags
+            has_updates = True
+        elif add_tags is not UNSET and add_tags is not None:
+            existing_tags = set(existing.get("tags", []))
+            new_tags = existing_tags | set(add_tags)
+            payload["tags"] = sorted(new_tags)
+            has_updates = True
+
+        for field, key in (
+            (status, "status"),
+            (priority, "priority"),
+            (severity, "severity"),
+            (issue_type, "issue_type"),
+            (assigned_to, "assigned_to"),
+        ):
+            if field is not UNSET:
+                payload[key] = field
+                has_updates = True
+
+        if not has_updates:
+            raise ValueError("At least one field must be provided to update the issue")
+
+        if version is UNSET or version is None:
+            version_value = existing.get("version")
+            if version_value is None:
+                raise TaigaAPIError("Unable to resolve version for issue update")
+            try:
+                payload["version"] = int(version_value)
+            except (TypeError, ValueError):
+                raise TaigaAPIError("Unable to resolve version for issue update") from None
+        else:
+            payload["version"] = int(version)
+
+        try:
+            updated = await client.update_issue(issue_id, payload)
+        except TaigaAPIError as exc:
+            if exc.status_code == 409:
+                latest = await client.get_issue(issue_id)
+                latest_version = latest.get("version")
+                raise ValueError(
+                    f"Conflict updating issue {issue_id}: latest version is {latest_version}"
+                ) from exc
+            raise
+
+    return dict(updated)
+
+
+async def taiga_issues_delete(issue_id: int) -> dict[str, Any]:
+    """Delete an issue (DESTRUCTIVE)."""
+
+    async with get_taiga_client() as client:
+        await client.delete_issue(issue_id)
+    return {"id": issue_id, "deleted": True}
+
+
+if DESTRUCTIVE_ENABLED:
+    taiga_issues_delete = mcp.tool(
+        name="taiga_issues_delete",
+        annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
+    )(taiga_issues_delete)
 
 
 def _make_idempotency_cache_key(raw_key: str, user_story_id: int, subject: str) -> str:
@@ -1680,7 +2195,7 @@ async def _resolve_task_status_id(client, project_id: int, status: int | str | N
 
 
 @mcp.tool(
-    name="taiga.stories.get",
+    name="taiga_stories_get",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_stories_get(user_story_id: int) -> dict[str, Any]:
@@ -1699,11 +2214,11 @@ async def taiga_stories_get(user_story_id: int) -> dict[str, Any]:
 
 
 @mcp.tool(
-    name="taiga.stories.list",
+    name="taiga_stories_list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_stories_list(
-    project_id: int,
+    project_id: int | None = None,
     search: str | None = None,
     epic_id: int | None = None,
     tags: list[str] | None = None,
@@ -1716,8 +2231,9 @@ async def taiga_stories_list(
     effective_page_size = min(page_size or 50, 100) if page_size else 50
     
     async with get_taiga_client() as client:
+        resolved_project_id = await _require_project_id(client, project_id)
         stories = await client.list_user_stories(
-            project_id,
+            resolved_project_id,
             epic=epic_id,
             q=search,
             tags=tags,
@@ -1743,7 +2259,7 @@ async def taiga_stories_list(
 
 
 @mcp.tool(
-    name="taiga.stories.create",
+    name="taiga_stories_create",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
 async def taiga_stories_create(
@@ -1789,7 +2305,7 @@ async def taiga_stories_create(
 
 
 @mcp.tool(
-    name="taiga.stories.update",
+    name="taiga_stories_update",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
 async def taiga_stories_update(
@@ -1904,10 +2420,6 @@ async def taiga_stories_update(
     return dict(updated)
 
 
-@mcp.tool(
-    name="taiga.stories.delete",
-    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
-)
 async def taiga_stories_delete(user_story_id: int) -> dict[str, Any]:
     """Delete a user story (DESTRUCTIVE - consider archive_or_close for production).
     
@@ -1923,10 +2435,13 @@ async def taiga_stories_delete(user_story_id: int) -> dict[str, Any]:
     return {"id": user_story_id, "deleted": True}
 
 
-@mcp.tool(
-    name="taiga.epics.delete",
-    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
-)
+if DESTRUCTIVE_ENABLED:
+    taiga_stories_delete = mcp.tool(
+        name="taiga_stories_delete",
+        annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
+    )(taiga_stories_delete)
+
+
 async def taiga_epics_delete(epic_id: int) -> dict[str, Any]:
     """Delete an epic (DESTRUCTIVE - cannot be undone).
     
@@ -1942,8 +2457,15 @@ async def taiga_epics_delete(epic_id: int) -> dict[str, Any]:
     return {"id": epic_id, "deleted": True}
 
 
+if DESTRUCTIVE_ENABLED:
+    taiga_epics_delete = mcp.tool(
+        name="taiga_epics_delete",
+        annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
+    )(taiga_epics_delete)
+
+
 @mcp.tool(
-    name="taiga.epics.add_user_story",
+    name="taiga_epics_add_user_story",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
 async def taiga_epics_add_user_story(epic_id: int, user_story_id: int) -> dict[str, Any] | None:
@@ -1955,7 +2477,7 @@ async def taiga_epics_add_user_story(epic_id: int, user_story_id: int) -> dict[s
 
 
 @mcp.tool(
-    name="taiga.tasks.create",
+    name="taiga_tasks_create",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
 async def taiga_tasks_create(
@@ -2016,7 +2538,7 @@ async def taiga_tasks_create(
 
 
 @mcp.tool(
-    name="taiga.tasks.update",
+    name="taiga_tasks_update",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
 async def taiga_tasks_update(
@@ -2123,10 +2645,6 @@ async def taiga_tasks_update(
     return dict(updated)
 
 
-@mcp.tool(
-    name="taiga.tasks.delete",
-    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
-)
 async def taiga_tasks_delete(task_id: int) -> dict[str, Any]:
     """Delete a task (DESTRUCTIVE - consider archive_or_close for production).
     
@@ -2142,8 +2660,15 @@ async def taiga_tasks_delete(task_id: int) -> dict[str, Any]:
     return {"id": task_id, "deleted": True}
 
 
+if DESTRUCTIVE_ENABLED:
+    taiga_tasks_delete = mcp.tool(
+        name="taiga_tasks_delete",
+        annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True),
+    )(taiga_tasks_delete)
+
+
 @mcp.tool(
-    name="taiga.tasks.archive_or_close",
+    name="taiga_tasks_archive_or_close",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
 async def taiga_tasks_archive_or_close(
@@ -2201,7 +2726,7 @@ async def taiga_tasks_archive_or_close(
 
 
 @mcp.tool(
-    name="taiga.stories.archive_or_close",
+    name="taiga_stories_archive_or_close",
     annotations=ToolAnnotations(openWorldHint=True, idempotentHint=False, destructiveHint=False),
 )
 async def taiga_stories_archive_or_close(
@@ -2259,7 +2784,7 @@ async def taiga_stories_archive_or_close(
 
 
 @mcp.tool(
-    name="taiga.tasks.list",
+    name="taiga_tasks_list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_tasks_list(
@@ -2326,7 +2851,7 @@ async def taiga_tasks_list(
 
 
 @mcp.tool(
-    name="taiga.tasks.get",
+    name="taiga_tasks_get",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_tasks_get(task_id: int) -> dict[str, Any]:
@@ -2345,7 +2870,7 @@ async def taiga_tasks_get(task_id: int) -> dict[str, Any]:
 
 
 @mcp.tool(
-    name="taiga.users.list",
+    name="taiga_users_list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_users_list(
@@ -2391,11 +2916,11 @@ async def taiga_users_list(
 
 
 @mcp.tool(
-    name="taiga.milestones.list",
+    name="taiga_milestones_list",
     annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True, idempotentHint=True),
 )
 async def taiga_milestones_list(
-    project_id: int,
+    project_id: int | None = None,
     search: str | None | _UnsetType = UNSET,
 ) -> list[dict[str, Any]]:
     """List milestones for a project with optional search filtering."""
@@ -2403,7 +2928,8 @@ async def taiga_milestones_list(
     search_filter = None if search is UNSET else search
 
     async with get_taiga_client() as client:
-        milestones = await client.list_milestones(project_id)
+        resolved_project_id = await _require_project_id(client, project_id)
+        milestones = await client.list_milestones(resolved_project_id)
 
     keep = (
         "id",
@@ -2443,6 +2969,232 @@ async def openapi_schema(_):
     This is intended for ChatGPT Custom GPT Actions (API-key auth via X-Api-Key).
     """
 
+    json_object_schema = {"type": "object", "additionalProperties": True}
+
+    paths: dict[str, Any] = {
+        "/actions/diagnostics": {
+            "get": {
+                "operationId": "diagnostics",
+                "parameters": [
+                    {
+                        "name": "slug",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Optional project slug to check for a match in the current user-visible projects list.",
+                    }
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/list_projects": {
+            "get": {
+                "operationId": "listProjects",
+                "parameters": [
+                    {"name": "search", "in": "query", "required": False, "schema": {"type": "string"}},
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/get_project": {
+            "get": {
+                "operationId": "getProject",
+                "parameters": [
+                    {"name": "project_id", "in": "query", "required": True, "schema": {"type": "integer"}},
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/get_project_by_slug": {
+            "get": {
+                "operationId": "getProjectBySlug",
+                "parameters": [
+                    {"name": "slug", "in": "query", "required": True, "schema": {"type": "string"}},
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/list_epics": {
+            "get": {
+                "operationId": "listEpics",
+                "parameters": [
+                    {
+                        "name": "project_id",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "array", "items": {"type": "integer"}},
+                        "style": "form",
+                        "explode": True,
+                        "description": "Taiga project id (repeatable). If omitted, defaults to TAIGA_PROJECT_ID / TAIGA_PROJECT_SLUG.",
+                    },
+                    {
+                        "name": "slug",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Project slug to resolve a project_id when project_id is omitted.",
+                    },
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/get_epic": {
+            "get": {
+                "operationId": "getEpic",
+                "parameters": [
+                    {"name": "epic_id", "in": "query", "required": True, "schema": {"type": "integer"}},
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/list_stories": {
+            "get": {
+                "operationId": "listStories",
+                "parameters": [
+                    {"name": "project_id", "in": "query", "required": True, "schema": {"type": "integer"}},
+                    {"name": "epic_id", "in": "query", "required": False, "schema": {"type": "integer"}},
+                    {"name": "search", "in": "query", "required": False, "schema": {"type": "string"}},
+                    {
+                        "name": "tag",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "array", "items": {"type": "string"}},
+                        "style": "form",
+                        "explode": True,
+                        "description": "Filter by tag(s). Repeat the query param to supply multiple tags.",
+                    },
+                    {"name": "page", "in": "query", "required": False, "schema": {"type": "integer"}},
+                    {"name": "page_size", "in": "query", "required": False, "schema": {"type": "integer"}},
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/get_story": {
+            "get": {
+                "operationId": "getStory",
+                "parameters": [
+                    {"name": "story_id", "in": "query", "required": True, "schema": {"type": "integer"}},
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/get_task": {
+            "get": {
+                "operationId": "getTask",
+                "parameters": [
+                    {"name": "task_id", "in": "query", "required": True, "schema": {"type": "integer"}},
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/statuses": {
+            "get": {
+                "operationId": "listStoryStatuses",
+                "parameters": [
+                    {"name": "project_id", "in": "query", "required": True, "schema": {"type": "integer"}},
+                ],
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/create_story": {
+            "post": {
+                "operationId": "createStory",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/add_story_to_epic": {
+            "post": {
+                "operationId": "addStoryToEpic",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/update_story": {
+            "post": {
+                "operationId": "updateStory",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/create_epic": {
+            "post": {
+                "operationId": "createEpic",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/update_epic": {
+            "post": {
+                "operationId": "updateEpic",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/create_task": {
+            "post": {
+                "operationId": "createTask",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/update_task": {
+            "post": {
+                "operationId": "updateTask",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/create_issue": {
+            "post": {
+                "operationId": "createIssue",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+        "/actions/update_issue": {
+            "post": {
+                "operationId": "updateIssue",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        },
+    }
+
+    if DESTRUCTIVE_ENABLED:
+        paths["/actions/delete_story"] = {
+            "post": {
+                "operationId": "deleteStory",
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": json_object_schema}},
+                },
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        }
+
+        paths["/actions/delete_epic"] = {
+            "post": {
+                "operationId": "deleteEpic",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        }
+        paths["/actions/delete_task"] = {
+            "post": {
+                "operationId": "deleteTask",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        }
+        paths["/actions/delete_issue"] = {
+            "post": {
+                "operationId": "deleteIssue",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": json_object_schema}}},
+                "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": json_object_schema}}}},
+            }
+        }
+
     schema: dict[str, Any] = {
         "openapi": "3.0.3",
         "info": {
@@ -2461,100 +3213,7 @@ async def openapi_schema(_):
             }
         },
         "security": [{"ApiKeyAuth": []}],
-        "paths": {
-            "/actions/list_projects": {
-                "get": {
-                    "operationId": "listProjects",
-                    "parameters": [
-                        {"name": "search", "in": "query", "required": False, "schema": {"type": "string"}},
-                    ],
-                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
-                }
-            },
-            "/actions/get_project_by_slug": {
-                "get": {
-                    "operationId": "getProjectBySlug",
-                    "parameters": [
-                        {"name": "slug", "in": "query", "required": True, "schema": {"type": "string"}},
-                    ],
-                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
-                }
-            },
-            "/actions/list_epics": {
-                "get": {
-                    "operationId": "listEpics",
-                    "parameters": [
-                        {
-                            "name": "project_id",
-                            "in": "query",
-                            "required": False,
-                            "schema": {"type": "integer"},
-                            "description": "Taiga project id (repeatable). If omitted, defaults to TAIGA_PROJECT_ID / TAIGA_PROJECT_SLUG.",
-                        },
-                        {
-                            "name": "slug",
-                            "in": "query",
-                            "required": False,
-                            "schema": {"type": "string"},
-                            "description": "Project slug to resolve a project_id when project_id is omitted.",
-                        },
-                    ],
-                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
-                }
-            },
-            "/actions/list_stories": {
-                "get": {
-                    "operationId": "listStories",
-                    "parameters": [
-                        {"name": "project_id", "in": "query", "required": False, "schema": {"type": "integer"}},
-                        {"name": "epic", "in": "query", "required": False, "schema": {"type": "integer"}},
-                        {"name": "q", "in": "query", "required": False, "schema": {"type": "string"}},
-                        {"name": "page", "in": "query", "required": False, "schema": {"type": "integer"}},
-                        {"name": "page_size", "in": "query", "required": False, "schema": {"type": "integer"}},
-                    ],
-                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
-                }
-            },
-            "/actions/get_story": {
-                "get": {
-                    "operationId": "getStory",
-                    "parameters": [
-                        {"name": "story_id", "in": "query", "required": True, "schema": {"type": "integer"}},
-                    ],
-                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
-                }
-            },
-            "/actions/create_story": {
-                "post": {
-                    "operationId": "createStory",
-                    "requestBody": {
-                        "required": True,
-                        "content": {"application/json": {"schema": {"type": "object", "additionalProperties": True}}},
-                    },
-                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
-                }
-            },
-            "/actions/update_story": {
-                "post": {
-                    "operationId": "updateStory",
-                    "requestBody": {
-                        "required": True,
-                        "content": {"application/json": {"schema": {"type": "object", "additionalProperties": True}}},
-                    },
-                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
-                }
-            },
-            "/actions/delete_story": {
-                "post": {
-                    "operationId": "deleteStory",
-                    "requestBody": {
-                        "required": True,
-                        "content": {"application/json": {"schema": {"type": "object", "additionalProperties": True}}},
-                    },
-                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}},
-                }
-            },
-        },
+        "paths": paths,
     }
 
     return JSONResponse(schema)
@@ -2566,39 +3225,44 @@ async def lifespan(_app):
         yield
 
 
-starlette_app = Starlette(
-    routes=[
-        Route("/", root),
-        Route("/healthz", healthz),
-        Route("/openapi.json", openapi_schema, methods=["GET"]),
-        Route("/actions/diagnostics", _diagnostics_action, methods=["GET"]),
-        Route("/actions/list_projects", _list_projects_action, methods=["GET"]),
-        Route("/actions/get_project", _get_project_action, methods=["GET"]),
-        Route("/actions/get_project_by_slug", _get_project_by_slug_action, methods=["GET"]),
-        Route("/actions/list_epics", _list_epics_action, methods=["GET"]),
-        Route("/actions/get_epic", _get_epic_action, methods=["GET"]),
-        Route("/actions/list_stories", _list_user_stories_action, methods=["GET"]),
-        Route("/actions/get_story", _get_story_action, methods=["GET"]),
-        Route("/actions/get_task", _get_task_action, methods=["GET"]),
-        Route("/actions/statuses", _list_statuses_action, methods=["GET"]),
-        Route("/actions/create_story", _create_story_action, methods=["POST"]),
-        Route("/actions/add_story_to_epic", _add_story_to_epic_action, methods=["POST"]),
-        Route("/actions/update_story", _update_story_action, methods=["POST"]),
-        Route("/actions/delete_story", _delete_story_action, methods=["POST"]),
-        Route("/actions/create_epic", _create_epic_action, methods=["POST"]),
-        Route("/actions/update_epic", _update_epic_action, methods=["POST"]),
-        Route("/actions/delete_epic", _delete_epic_action, methods=["POST"]),
-        Route("/actions/create_task", _create_task_action, methods=["POST"]),
-        Route("/actions/update_task", _update_task_action, methods=["POST"]),
-        Route("/actions/delete_task", _delete_task_action, methods=["POST"]),
-        Route("/actions/create_issue", _create_issue_action, methods=["POST"]),
-        Route("/actions/update_issue", _update_issue_action, methods=["POST"]),
-        Route("/actions/delete_issue", _delete_issue_action, methods=["POST"]),
-        Mount("/sse", app=sse_subapp),
-        Mount("/mcp", app=streamable_http_subapp),
-    ],
-    lifespan=lifespan,
-)
+_routes = [
+    Route("/", root),
+    Route("/healthz", healthz),
+    Route("/openapi.json", openapi_schema, methods=["GET"]),
+    Route("/actions/diagnostics", _diagnostics_action, methods=["GET"]),
+    Route("/actions/list_projects", _list_projects_action, methods=["GET"]),
+    Route("/actions/get_project", _get_project_action, methods=["GET"]),
+    Route("/actions/get_project_by_slug", _get_project_by_slug_action, methods=["GET"]),
+    Route("/actions/list_epics", _list_epics_action, methods=["GET"]),
+    Route("/actions/get_epic", _get_epic_action, methods=["GET"]),
+    Route("/actions/list_stories", _list_user_stories_action, methods=["GET"]),
+    Route("/actions/get_story", _get_story_action, methods=["GET"]),
+    Route("/actions/get_task", _get_task_action, methods=["GET"]),
+    Route("/actions/statuses", _list_statuses_action, methods=["GET"]),
+    Route("/actions/create_story", _create_story_action, methods=["POST"]),
+    Route("/actions/add_story_to_epic", _add_story_to_epic_action, methods=["POST"]),
+    Route("/actions/update_story", _update_story_action, methods=["POST"]),
+    Route("/actions/create_epic", _create_epic_action, methods=["POST"]),
+    Route("/actions/update_epic", _update_epic_action, methods=["POST"]),
+    Route("/actions/create_task", _create_task_action, methods=["POST"]),
+    Route("/actions/update_task", _update_task_action, methods=["POST"]),
+    Route("/actions/create_issue", _create_issue_action, methods=["POST"]),
+    Route("/actions/update_issue", _update_issue_action, methods=["POST"]),
+    Mount("/sse", app=sse_subapp),
+    Mount("/mcp", app=streamable_http_subapp),
+]
+
+if DESTRUCTIVE_ENABLED:
+    _routes.extend(
+        [
+            Route("/actions/delete_story", _delete_story_action, methods=["POST"]),
+            Route("/actions/delete_epic", _delete_epic_action, methods=["POST"]),
+            Route("/actions/delete_task", _delete_task_action, methods=["POST"]),
+            Route("/actions/delete_issue", _delete_issue_action, methods=["POST"]),
+        ]
+    )
+
+starlette_app = Starlette(routes=_routes, lifespan=lifespan)
 starlette_app.router.redirect_slashes = False
 
 # Starlette's function middleware uses BaseHTTPMiddleware which is unsafe for
