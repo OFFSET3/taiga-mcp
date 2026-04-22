@@ -3324,7 +3324,11 @@ class _NormalizeToolNames:
             if not body_consumed:
                 body_consumed = True
                 return {"type": "http.request", "body": normalized_body, "more_body": False}
-            return {"type": "http.disconnect"}
+            # Body already consumed — delegate to original receive so the downstream
+            # ASGI app (FastMCP / Starlette) gets the real http.disconnect when the
+            # client actually closes the connection.  Returning a synthetic disconnect
+            # here would cause FastMCP to cancel in-flight Taiga API calls prematurely.
+            return await receive()
 
         await self._app(scope, patched_receive, send)
 
