@@ -8,6 +8,7 @@ import time
 import warnings
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+import json
 from json import JSONDecodeError
 from typing import Any, Sequence
 
@@ -3265,9 +3266,74 @@ if DESTRUCTIVE_ENABLED:
 starlette_app = Starlette(routes=_routes, lifespan=lifespan)
 starlette_app.router.redirect_slashes = False
 
+class _NormalizeToolNames:
+    """ASGI middleware: normalize dot-notation MCP tool names to underscore notation.
+
+    Rewrites incoming JSON-RPC 'tools/call' requests where the tool name uses
+    dot notation (e.g. 'taiga.projects.list') to underscore notation
+    ('taiga_projects_list') before dispatching to FastMCP.
+
+    This provides backward compatibility for connectors whose tool-discovery
+    cache was populated before the v1.2.0 rename.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        # Buffer the full request body so we can inspect / rewrite it.
+        body_chunks: list[bytes] = []
+        more_body = True
+        while more_body:
+            message = await receive()
+            body_chunks.append(message.get("body", b""))
+            more_body = message.get("more_body", False)
+
+        raw_body = b"".join(body_chunks)
+        normalized_body = raw_body
+
+        if raw_body:
+            try:
+                data = json.loads(raw_body)
+                if (
+                    isinstance(data, dict)
+                    and data.get("method") == "tools/call"
+                    and isinstance(data.get("params"), dict)
+                    and isinstance(data["params"].get("name"), str)
+                    and "." in data["params"]["name"]
+                ):
+                    original = data["params"]["name"]
+                    data["params"]["name"] = original.replace(".", "_")
+                    logger.info(
+                        "_NormalizeToolNames: rewrote '%s' -> '%s'",
+                        original,
+                        data["params"]["name"],
+                    )
+                    normalized_body = json.dumps(data).encode()
+            except (JSONDecodeError, KeyError, TypeError):
+                pass
+
+        body_consumed = False
+
+        async def patched_receive():
+            nonlocal body_consumed
+            if not body_consumed:
+                body_consumed = True
+                return {"type": "http.request", "body": normalized_body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        await self._app(scope, patched_receive, send)
+
+
 # Starlette's function middleware uses BaseHTTPMiddleware which is unsafe for
 # streaming responses (e.g., SSE). Use a pure-ASGI wrapper for path rewrites.
-app = _RewriteMountedPaths(starlette_app)
+# _NormalizeToolNames sits outermost so dot-notation tool names from stale
+# connector caches are transparently rewritten before FastMCP dispatches them.
+app = _NormalizeToolNames(_RewriteMountedPaths(starlette_app))
 
 
 if __name__ == "__main__":
