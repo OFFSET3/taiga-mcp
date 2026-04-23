@@ -60,6 +60,24 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _optional_stripped_env(name: str) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    s = raw.strip()
+    return s or None
+
+
+def _parse_bearer_token(raw: str) -> str:
+    """Return the token value; strip a leading 'Bearer ' prefix if present."""
+    t = raw.strip()
+    if t.lower().startswith("bearer "):
+        t = t[7:].strip()
+    if not t:
+        raise TaigaAPIError("TAIGA_AUTH_TOKEN is set but empty after parsing")
+    return t
+
+
 class TaigaClient:
     """Thin async wrapper around Taiga's REST API."""
 
@@ -67,8 +85,15 @@ class TaigaClient:
         base_url = _require_env("TAIGA_BASE_URL")
         base_url = self._normalize_base_url(base_url)
 
-        self._username = _require_env("TAIGA_USERNAME")
-        self._password = _require_env("TAIGA_PASSWORD")
+        static_bearer = _optional_stripped_env("TAIGA_AUTH_TOKEN")
+        if static_bearer is not None:
+            self._static_bearer = _parse_bearer_token(static_bearer)
+            self._username: str | None = None
+            self._password: str | None = None
+        else:
+            self._static_bearer = None
+            self._username = _require_env("TAIGA_USERNAME")
+            self._password = _require_env("TAIGA_PASSWORD")
 
         self._client = httpx.AsyncClient(
             base_url=base_url,
@@ -104,6 +129,13 @@ class TaigaClient:
     async def authenticate(self) -> None:
         if self._auth_token:
             return
+
+        if self._static_bearer is not None:
+            self._auth_token = self._static_bearer
+            self._client.headers["Authorization"] = f"Bearer {self._static_bearer}"
+            return
+
+        assert self._username is not None and self._password is not None
         payload = {
             "type": "normal",
             "username": self._username,
