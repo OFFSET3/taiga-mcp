@@ -28,7 +28,8 @@
 ## Configuration
 - Copy `.env.example` to `.env` (or export the variables directly) and fill in values for your Taiga instance, credentials, and deployment settings.
 - Never commit `.env` files or secrets; the project `.gitignore` excludes common patterns by default.
-- Local scripts and helper apps read the same variables (`TAIGA_BASE_URL`, `TAIGA_USERNAME`, `TAIGA_PASSWORD`, `ACTION_PROXY_API_KEY`, `MCP_URL`, `TAIGA_PROXY_BASE_URL`, and friends), so updating the environment keeps the entire toolchain aligned.
+- **Taiga:** set `TAIGA_BASE_URL` for your instance (required in all cases). For credentials, either set a Taiga **application token** in `TAIGA_AUTH_TOKEN` (used as `Authorization: Bearer …`), or set `TAIGA_USERNAME` and `TAIGA_PASSWORD` (the server calls `/auth` to obtain a bearer token). If `TAIGA_AUTH_TOKEN` is set, username/password are ignored.
+- Local scripts and helper apps read the same variables (`TAIGA_BASE_URL`, `TAIGA_AUTH_TOKEN` or `TAIGA_USERNAME`/`TAIGA_PASSWORD`, `ACTION_PROXY_API_KEY`, `MCP_URL`, `TAIGA_PROXY_BASE_URL`, and friends), so updating the environment keeps the entire toolchain aligned.
 
 ## Runtime Architecture
 - `app.py` instantiates `FastMCP` with the Taiga MCP identity, mounts SSE at `/sse/` and Streamable HTTP at `/mcp/`, and disables trailing-slash redirects to preserve MCP session headers.

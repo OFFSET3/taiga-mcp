@@ -272,6 +272,20 @@ def _redact_email(value: str | None) -> str | None:
     return f"{masked_local}@{domain}"
 
 
+def _taiga_uses_auth_token() -> bool:
+    """True when TAIGA_AUTH_TOKEN is set; Taiga is authenticated with a static bearer token."""
+    return bool((os.getenv("TAIGA_AUTH_TOKEN") or "").strip())
+
+
+def _taiga_diagnostics_auth() -> dict[str, Any]:
+    if _taiga_uses_auth_token():
+        return {"taiga_auth_mode": "token", "taiga_username": None}
+    return {
+        "taiga_auth_mode": "password",
+        "taiga_username": _redact_email(os.getenv("TAIGA_USERNAME")),
+    }
+
+
 def _verify_api_key(request: Request) -> JSONResponse | None:
     expected = _expected_api_key()
     if not expected:
@@ -509,7 +523,7 @@ async def _diagnostics_action(request: Request) -> JSONResponse:
 
     slug = request.query_params.get("slug")
     base_url = os.getenv("TAIGA_BASE_URL")
-    username = _redact_email(os.getenv("TAIGA_USERNAME"))
+    auth = _taiga_diagnostics_auth()
 
     try:
         async with get_taiga_client() as client:
@@ -520,7 +534,7 @@ async def _diagnostics_action(request: Request) -> JSONResponse:
             {
                 "diagnostics": {
                     "taiga_base_url": base_url,
-                    "taiga_username": username,
+                    **auth,
                     "error": str(exc),
                 }
             }
@@ -542,7 +556,7 @@ async def _diagnostics_action(request: Request) -> JSONResponse:
         {
             "diagnostics": {
                 "taiga_base_url": base_url,
-                "taiga_username": username,
+                **auth,
                 "user_id": user_id,
                 "projects_count": len(projects),
                 "project_slugs_sample": slugs,
@@ -1704,7 +1718,6 @@ async def taiga_diagnostics(project_slug: str | None = None) -> dict[str, Any]:
     """
 
     base_url = os.getenv("TAIGA_BASE_URL")
-    username = _redact_email(os.getenv("TAIGA_USERNAME"))
     default_project_id_env = os.getenv("TAIGA_PROJECT_ID")
     default_project_slug_env = os.getenv("TAIGA_PROJECT_SLUG")
 
@@ -1738,7 +1751,7 @@ async def taiga_diagnostics(project_slug: str | None = None) -> dict[str, Any]:
             "enabled": DESTRUCTIVE_ENABLED,
         },
         "taiga_base_url": base_url,
-        "taiga_username": username,
+        **_taiga_diagnostics_auth(),
         "user_id": user_id,
         "projects_count": len(projects),
         "project_slugs_sample": slugs,
