@@ -1931,7 +1931,14 @@ async def taiga_epics_update(
             payload["tags"] = [] if tags is None else tags
             has_updates = True
         elif add_tags is not UNSET and add_tags is not None:
-            existing_tags = set(existing.get("tags", []))
+            # Taiga returns tags as ``[name, color]`` pairs.  Normalize to
+            # names before merging; set(list) raises ``unhashable type``.
+            existing_tags = {
+                tag[0] if isinstance(tag, (list, tuple)) and tag else tag
+                for tag in existing.get("tags", [])
+                if isinstance(tag, str)
+                or (isinstance(tag, (list, tuple)) and tag and isinstance(tag[0], str))
+            }
             new_tags = existing_tags | set(add_tags)
             payload["tags"] = sorted(new_tags)
             has_updates = True
