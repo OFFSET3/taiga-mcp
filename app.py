@@ -3292,6 +3292,15 @@ class _NormalizeToolNames:
             await self._app(scope, receive, send)
             return
 
+        if scope.get("method") != "POST":
+            await self._app(scope, receive, send)
+            return
+
+        path = scope.get("path")
+        if path not in ("/mcp", "/mcp/"):
+            await self._app(scope, receive, send)
+            return
+
         # Buffer the full request body so we can inspect / rewrite it.
         body_chunks: list[bytes] = []
         more_body = True
